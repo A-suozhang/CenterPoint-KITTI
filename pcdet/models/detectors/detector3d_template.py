@@ -1,3 +1,4 @@
+from functools import partial
 import os
 
 import torch
@@ -11,11 +12,12 @@ from ..model_utils import model_nms_utils
 
 
 class Detector3DTemplate(nn.Module):
-    def __init__(self, model_cfg, num_class, dataset):
+    def __init__(self, model_cfg, num_class, dataset,times,):
         super().__init__()
         self.model_cfg = model_cfg
         self.num_class = num_class
         self.dataset = dataset
+        self.times = times
         self.class_names = dataset.class_names
         self.register_buffer('global_step', torch.LongTensor(1).zero_())
 
@@ -67,6 +69,7 @@ class Detector3DTemplate(nn.Module):
 
         backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
             model_cfg=self.model_cfg.BACKBONE_3D,
+            times = self.times,
             input_channels=model_info_dict['num_point_features'],
             grid_size=model_info_dict['grid_size'],
             voxel_size=model_info_dict['voxel_size'],
@@ -85,7 +88,7 @@ class Detector3DTemplate(nn.Module):
             grid_size=model_info_dict['grid_size']
         )
         model_info_dict['module_list'].append(map_to_bev_module)
-        model_info_dict['num_bev_features'] = map_to_bev_module.num_bev_features
+        model_info_dict['num_bev_features'] = map_to_bev_module.num_bev_features * self.times
         return map_to_bev_module, model_info_dict
 
     def build_backbone_2d(self, model_info_dict):
