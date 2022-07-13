@@ -379,6 +379,11 @@ class KittiDataset(DatasetTemplate):
             if road_plane is not None:
                 input_dict['road_plane'] = road_plane
 
+        # ==================
+        # TODO: dev some of the input-dependent metrcis here(e.g., point-density...primitive fitting...)
+        # as the extra channel for input of the VFE
+        # or additional args in data_dict
+
         data_dict = self.prepare_data(data_dict=input_dict)
 
         data_dict['image_shape'] = img_shape

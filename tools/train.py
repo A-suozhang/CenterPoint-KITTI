@@ -4,6 +4,7 @@ import glob
 import os
 from pathlib import Path
 from test import repeat_eval_ckpt
+import shutil
 
 import torch
 import torch.distributed as dist
@@ -80,10 +81,19 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
-    output_dir = cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag / str(args.times)
+    output_dir = cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
     ckpt_dir = output_dir / 'ckpt'
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # bakup the training files
+    if not os.path.exists(os.path.join(output_dir, 'tools')):
+        shutil.copytree('../tools', os.path.join(output_dir,'tools'))
+    if not os.path.exists(os.path.join(output_dir, 'pcdet')):
+        # exclude the ops(54M)
+        shutil.copytree('../pcdet/datasets', os.path.join(output_dir,'./pcdet/datasets'))
+        shutil.copytree('../pcdet/models', os.path.join(output_dir,'./pcdet/models'))
+        shutil.copytree('../pcdet/utils', os.path.join(output_dir,'./pcdet/utils'))
 
     log_file = output_dir / ('log_train_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     logger = common_utils.create_logger(log_file, rank=cfg.LOCAL_RANK)

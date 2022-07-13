@@ -7,6 +7,10 @@ class CenterPoint(Detector3DTemplate):
         self.module_list = self.build_networks()
 
     def forward(self, batch_dict):
+
+        # ======== 
+        # TODO: when adding new module, maybe change the logic here
+        # introducing new predictor module* 
         for cur_module in self.module_list:
             batch_dict = cur_module(batch_dict)
 
@@ -22,6 +26,7 @@ class CenterPoint(Detector3DTemplate):
             return pred_dicts, recall_dicts
 
     def get_training_loss(self):
+        # TODO: new reg term, here
         disp_dict = {}
 
         loss_rpn, tb_dict = self.dense_head.get_loss()
