@@ -387,6 +387,15 @@ class KittiDataset(DatasetTemplate):
         data_dict = self.prepare_data(data_dict=input_dict)
 
         data_dict['image_shape'] = img_shape
+
+        # save and visulize the point cloud
+        # d = {}
+        # d['points'] = data_dict['points']
+        # d['voxel'] = data_dict['voxel_coords']
+        # import torch
+        # torch.save(d, './visualization/kitti.pth')
+        # import ipdb; ipdb.set_trace()
+
         return data_dict
 
 

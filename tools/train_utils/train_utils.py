@@ -58,6 +58,11 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                     tb_log.add_scalar('train/' + key, val, accumulated_iter)
     if rank == 0:
         pbar.close()
+    d={}
+    d['loc_lss_list'] = model.dense_head.loc_lss_list
+    torch.save(d, f"./visualization/loc_lss_list_{model.dense_head.vfe_config['NAME']}{model.dense_head.vfe_config['VOXEL_PERCENT']}.pth")
+    model.dense_head.loc_lss_list
+    exit()
     return accumulated_iter
 
 

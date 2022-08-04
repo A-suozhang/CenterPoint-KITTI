@@ -2,15 +2,17 @@ import argparse
 import glob
 from pathlib import Path
 
-import mayavi.mlab as mlab
+#import mayavi.mlab as mlab
 import numpy as np
 import torch
+import os
+from ipdb import set_trace
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import DatasetTemplate
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils import common_utils
-from visual_utils import visualize_utils as V
+#from visual_utils import visualize_utils as V
 
 
 class DemoDataset(DatasetTemplate):
@@ -47,8 +49,8 @@ class DemoDataset(DatasetTemplate):
         input_dict = {
             'points': points,
             'frame_id': index,
-        }
-
+            }
+ 
         data_dict = self.prepare_data(data_dict=input_dict)
         return data_dict
 
@@ -61,6 +63,8 @@ def parse_config():
                         help='specify the point cloud data file or directory')
     parser.add_argument('--ckpt', type=str, default=None, help='specify the pretrained model')
     parser.add_argument('--ext', type=str, default='.bin', help='specify the extension of your point cloud data file')
+    parser.add_argument('--times', type=int, default=16, help='3D backbone channel. For VoxelBackBone8x, default is 16')
+    parser.add_argument('--gpu', type=int, default=0, help='the gpu-id')
 
     args = parser.parse_args()
 
@@ -71,6 +75,7 @@ def parse_config():
 
 def main():
     args, cfg = parse_config()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     logger = common_utils.create_logger()
     logger.info('-----------------Quick Demo of OpenPCDet-------------------------')
     demo_dataset = DemoDataset(
@@ -78,8 +83,8 @@ def main():
         root_path=Path(args.data_path), ext=args.ext, logger=logger
     )
     logger.info(f'Total number of samples: \t{len(demo_dataset)}')
-
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=demo_dataset)
+    
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=demo_dataset, times = args.times)
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=True)
     model.cuda()
     model.eval()
@@ -89,12 +94,17 @@ def main():
             data_dict = demo_dataset.collate_batch([data_dict])
             load_data_to_gpu(data_dict)
             pred_dicts, _ = model.forward(data_dict)
-
+            torch.save({'pred':pred_dicts,
+                        'point':data_dict['points'][:, 1:]}
+               ,'./demo_pred_dicts.pth')
+            
+            '''
             V.draw_scenes(
                 points=data_dict['points'][:, 1:], ref_boxes=pred_dicts[0]['pred_boxes'],
                 ref_scores=pred_dicts[0]['pred_scores'], ref_labels=pred_dicts[0]['pred_labels']
             )
             mlab.show(stop=True)
+            '''
 
     logger.info('Demo done.')
 

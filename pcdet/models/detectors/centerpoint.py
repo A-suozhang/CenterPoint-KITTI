@@ -12,6 +12,7 @@ class CenterPoint(Detector3DTemplate):
         # TODO: when adding new module, maybe change the logic here
         # introducing new predictor module* 
         for cur_module in self.module_list:
+            #import ipdb; ipdb.set_trace()
             batch_dict = cur_module(batch_dict)
 
         if self.training:

@@ -90,7 +90,9 @@ class BaseBEVBackbone(nn.Module):
         ret_dict = {}
         x = spatial_features
         for i in range(len(self.blocks)):
+            #import ipdb; ipdb.set_trace()
             x = self.blocks[i](x)
+        
 
             stride = int(spatial_features.shape[2] / x.shape[2])
             ret_dict['spatial_features_%dx' % stride] = x

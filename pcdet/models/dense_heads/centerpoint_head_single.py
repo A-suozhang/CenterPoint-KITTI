@@ -26,15 +26,16 @@ def multi_apply(func, *args, **kwargs):
     return tuple(map(list, zip(*map_results)))
 
 class CenterHead(nn.Module):
-    def __init__(self, model_cfg, input_channels, num_class, class_names, grid_size, point_cloud_range,
+    def __init__(self, model_cfg, input_channels,vfe_config, num_class, class_names, grid_size, point_cloud_range,
                  predict_boxes_when_training=True):
         super().__init__()
         self.model_cfg = model_cfg
+        self.vfe_config = vfe_config
         self.num_class = num_class
         self.class_names = [class_names]
         self.predict_boxes_when_training = predict_boxes_when_training
         self.use_multihead = self.model_cfg.get('USE_MULTIHEAD', False)
-
+        self.loc_lss_list =[]
         target_cfg = self.model_cfg.TARGET_ASSIGNER_CONFIG
 
         self.target_cfg = target_cfg 
@@ -354,6 +355,13 @@ class CenterHead(nn.Module):
         # NHWC -> NCHW 
         pred_heatmaps = clip_sigmoid(self.forward_ret_dict['cls_preds']).permute(0, 3, 1, 2) 
         gt_heatmaps =  self.forward_ret_dict['heatmaps'][0]
+        # save pred_heatmaps and gt_heatmaps
+        # d={}
+        # d['pred_heatmaps'] = pred_heatmaps
+        # d['gt_heatmaps'] = gt_heatmaps
+        # torch.save(d, f"./visualization/heatmaps_{self.vfe_config['NAME']}{self.vfe_config['VOXEL_PERCENT']}.pth")
+        # exit()
+        # import ipdb; ipdb.set_trace()
         num_pos = gt_heatmaps.eq(1).float().sum().item()
 
         cls_loss = self.loss_cls(
@@ -388,6 +396,7 @@ class CenterHead(nn.Module):
             pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
 
         loc_loss = loc_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
+        self.loc_lss_list.append(loc_loss)
         box_loss = loc_loss
         tb_dict = {
             'rpn_loss_loc': loc_loss.item()
