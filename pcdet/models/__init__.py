@@ -30,6 +30,11 @@ def model_fn_decorator():
         ret_dict, tb_dict, disp_dict = model(batch_dict)
 
         loss = ret_dict['loss'].mean()
+
+        # ===== apply reg logic here =====
+        if 'predictor_loss' in ret_dict.keys():
+            loss += ret_dict['predictor_loss']
+
         if hasattr(model, 'update_global_step'):
             model.update_global_step()
         else:

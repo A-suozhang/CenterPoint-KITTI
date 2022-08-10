@@ -38,6 +38,7 @@ def parse_config():
     parser.add_argument('--ckpt_dir', type=str, default=None, help='specify a ckpt directory to be evaluated if needed')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--times', type=int, default=16, help='3D backbone channel. For VoxelBackBone8x, default is 16')
+    parser.add_argument('--gpu', type=int, default=0, help='the gpu-id')
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -53,7 +54,8 @@ def parse_config():
 
 
 def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=False):
-    # load checkpoint
+    # load checkpointA
+    # import ipdb; ipdb.set_trace()
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test)
     model.cuda()
 
@@ -169,6 +171,7 @@ def main():
 
     # log to file
     logger.info('**********************Start logging**********************')
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     gpu_list = os.environ['CUDA_VISIBLE_DEVICES'] if 'CUDA_VISIBLE_DEVICES' in os.environ.keys() else 'ALL'
     logger.info('CUDA_VISIBLE_DEVICES=%s' % gpu_list)
 
@@ -179,21 +182,22 @@ def main():
     log_config_to_file(cfg, logger=logger)
 
     ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else output_dir / 'ckpt'
-
+    args.batch_size = 7
     test_set, test_loader, sampler = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
         batch_size=args.batch_size,
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
-
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set,times=args.times)
     with torch.no_grad():
         if args.eval_all:
             repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test)
         else:
             eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
-
+    d={}
+    d['loc_lss_list'] = model.dense_head.loc_lss_list
+    torch.save(d, f"/home/nfs_data/lupu/CenterPoint-KITTI/tools/visualization/loc_lss_list_{model.dense_head.vfe_config['NAME']}{model.dense_head.vfe_config['VOXEL_PERCENT']}.pth")
 
 if __name__ == '__main__':
     main()

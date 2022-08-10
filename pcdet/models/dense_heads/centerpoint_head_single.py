@@ -88,6 +88,10 @@ class CenterHead(nn.Module):
             data_dict['batch_cls_preds'] = batch_cls_preds
             data_dict['batch_box_preds'] = batch_box_preds
             data_dict['cls_preds_normalized'] = False
+            targets_dict = self.assign_targets(
+                gt_boxes=data_dict['gt_boxes']
+            )
+            self.forward_ret_dict.update(targets_dict)
 
         return data_dict
 
@@ -393,10 +397,11 @@ class CenterHead(nn.Module):
         bbox_weights = mask * mask.new_tensor(code_weights)
         
         loc_loss = l1_loss(
-            pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
-
+            pred, target_box, bbox_weights,reduction='none' ,avg_factor=(num + 1e-4))
+        #avg_factor=(num + 1e-4)
         loc_loss = loc_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
         self.loc_lss_list.append(loc_loss)
+        loc_loss = loc_loss.sum() / (num + 1e-4)
         box_loss = loc_loss
         tb_dict = {
             'rpn_loss_loc': loc_loss.item()

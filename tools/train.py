@@ -110,7 +110,8 @@ def main():
         logger.info('{:16} {}'.format(key, val))
     log_config_to_file(cfg, logger=logger)
     if cfg.LOCAL_RANK == 0:
-        os.system('cp %s %s' % (args.cfg_file, output_dir))
+        # save the config filename as "config.yaml" for better loading
+        os.system('cp %s %s' % (args.cfg_file, os.path.join(output_dir, "config.yaml")))
 
     tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
 
@@ -193,7 +194,7 @@ def main():
     test_set, test_loader, sampler = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
-        batch_size=args.batch_size,
+        batch_size=7 , #args.batch_size,
         dist=dist_train, workers=args.workers, logger=logger, training=False
     )
     eval_output_dir = output_dir / 'eval' / 'eval_with_train'
