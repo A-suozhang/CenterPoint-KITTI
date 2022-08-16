@@ -18,7 +18,8 @@ from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
 import os
-
+import warnings
+# os.environ['CUBLAS_WORKSPACE_CONFIG']=":4096:8"
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
@@ -133,7 +134,10 @@ def main():
     model.cuda()
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
-
+    if model.module_list[1].train_predictor_only:
+        # print(model.module_list[1].predictor_conv)
+        optimizer = build_optimizer(model.module_list[1].predictor_conv
+        , cfg.OPTIMIZATION)
     # load checkpoint if it is possible
     start_epoch = it = 0
     last_epoch = -1
@@ -211,4 +215,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        main()

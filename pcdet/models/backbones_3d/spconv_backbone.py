@@ -72,10 +72,11 @@ class VoxelBackBone8x(nn.Module):
         super().__init__()
         self.model_cfg = model_cfg
         norm_fn = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
-
+        self.i=0
+        self.save_dict={}
         # ----- the predictor related configs ------
         # TODO: feature-based predictor design
-        # Input: [N, C] voxel featrues -> Project to BEV
+        # Input: [N, C] voxel features -> Project to BEV
         # Predictor: [Conv, FC]
         # Loss: MSE, regress the heatmap (possibly regs)
         # ------------------------------------------
@@ -86,14 +87,24 @@ class VoxelBackBone8x(nn.Module):
         self.use_predictor = self.model_cfg['use_predictor'] if 'use_predictor' in self.model_cfg.keys() else False
          # make it a global switch for whether use the predictor or not, change it in `train.py`, reading the config and turn it on at certain epoch
         self.predictor_warmup = False
+        self.train_predictor_only = True
         if self.use_predictor:
+            self.pools = nn.ModuleList([
+                spconv.SparseMaxPool3d(kernel_size=8),
+                spconv.SparseMaxPool3d(kernel_size=4),
+                spconv.SparseMaxPool3d(kernel_size=2),
+                ]
+            )
             self.pool1 = spconv.SparseMaxPool3d(kernel_size=8)
             self.pool2 = spconv.SparseMaxPool3d(kernel_size=4)
             self.pool3 = spconv.SparseMaxPool3d(kernel_size=2)
-            self.predictor = nn.Sequential(             # use self.predictor_forward for masked sparse conv2d
-                nn.Conv2d(4*times*5,1,kernel_size=5,padding='same'),
-                nn.ReLU(),
-                    )
+            # self.predictor = nn.Sequential(         # use self.predictor_forward for masked sparse conv2d
+                # nn.Conv2d(4*times*5,1,kernel_size=5,padding='same'),
+                # nn.ReLU(),
+                    # )
+            self.predictor_conv = nn.Conv2d(4*times*5,1,kernel_size=5,padding='same')
+            self.predictor_bn = nn.BatchNorm2d(1)
+            self.predictor_nonlinear = nn.Sigmoid()
             # Input [x_conv3(max-channel-output)*Z-axis-size]
             # kernel-size should roughly be like the gaussian kernel(TODO: need deiciding)
             self.gt_heatmap = None
@@ -119,7 +130,7 @@ class VoxelBackBone8x(nn.Module):
             block(2*times, 2*times, 3, norm_fn=norm_fn, padding=1, indice_key='subm2'),
             block(2*times, 2*times, 3, norm_fn=norm_fn, padding=1, indice_key='subm2'),
         )
-
+        self.conv_list = nn.ModuleList([self.conv1,self.conv2])
         self.conv3 = spconv.SparseSequential(
             # [800, 704, 21] <- [400, 352, 11]
             block(2*times, 4*times, 3, norm_fn=norm_fn, stride=2, padding=1, indice_key='spconv3', conv_type='spconv'),
@@ -145,28 +156,77 @@ class VoxelBackBone8x(nn.Module):
         )
         self.num_point_features = 8*times
 
-    def predictor_forward(self, x):
-        # conduct the predictor forward
-        # Filter to generate the ``masked`` Conv2d
-        # x: [bs, ch*Z, W, H]
-        sparse_mask_ = (x.sum(dim=1).unsqueeze(1) > 0).int()
-        out = self.predictor(x)
-        out = out*sparse_mask_
-        return out
+    # def predictor_forward(self, x):
+        # # conduct the predictor forward
+        # # Filter to generate the ``masked`` Conv2d
+        # # x: [bs, ch*Z, W, H]
+        # sparse_mask_ = (x.sum(dim=1).unsqueeze(1) != 0).int()
+        # out = self.predictor(x)  # maybe calc loss here
+        # out = out*sparse_mask_
+        # return out
 
-    def drop_voxel(self, bev_data, conf_map, voxel_data, voxel_data_pooled):
-        # return new voxel-data and dropped voxel index
+    def drop_voxel(self, x,frame_id,level):#sparse_mask_, conf_map, voxel_data, voxel_data_pooled)
+        x_conv = self.conv_list[level](x)
+        if torch.isnan(x.features).sum()>0:
+            print('X Nan Here!')
+            import ipdb; ipdb.set_trace()
+        x_pool_ = self.pools[level](x_conv)  # use pooling to pool all-levels of feature to the last dim(conv_4); TODO: the max-pool also pools the Z-axis feature harshly
 
+        if torch.isnan(x_conv.features).sum()>0:
+            print('X-conv1 Nan Here!')
+            import ipdb; ipdb.set_trace()
+        x_pool = x_pool_.dense()  # use pooling to pool all-levels of feature to the last dim(conv_4); TODO: the max-pool also pools the Z-axis feature harshly
+        N,C,D,W,H=x_pool.shape                # concat the Z-axis to channel-dims,2-d HeatMap: [N,C,W,H]
+        x_pool1_bak = x_pool
+        x_pool = x_pool.reshape([N,-1,W,H])
+        pool_size = 4//(level+1)
+        x_pool = torch.repeat_interleave(x_pool,pool_size,dim=1)
+        sparse_mask_ = (x_pool.sum(dim=1).unsqueeze(1) != 0).int()
+        out1 = self.predictor_conv(x_pool)
+        out1_bn = self.predictor_bn(out1)
+        out = self.predictor_nonlinear(out1)
+        conf_map = out*sparse_mask_
+        if frame_id[0]=='000000':
+            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
+            self.save_dict['input'] = x_pool[0]
+            self.save_dict['pre-bn'] = out1[0]
+            self.save_dict['post-bn'] = out1_bn[0]
+            self.save_dict['post-nonlinear'] = out[0]
+            self.save_dict['sparse-mask'] = sparse_mask_[0]
+            self.save_dict['gt_heatmap'] = gt_heatmap[0]
+            torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
+        if frame_id[1]=='000000':
+            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2)
+            self.save_dict['input'] = x_pool[1]
+            self.save_dict['pre-bn'] = out1[1]
+            self.save_dict['post-bn'] = out1_bn[1]
+            self.save_dict['post-nonlinear'] = out[1]
+            self.save_dict['sparse-mask'] = sparse_mask_[1]
+            self.save_dict['gt_heatmap'] = gt_heatmap[0]
+            torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
+            # DEBUG_ONLY:
+            # conf_map1_sparse_ratio = (conf_map1 > 0).sum() / conf_map1.nelement()
+            # out_sparse_ratio = (out > 0).sum() / out.nelement()
+            # sparse_mask_1_sparse_ratio = (sparse_mask_1 > 0).sum() / sparse_mask_1.nelement()
+            # x_pool1_sparse_ratio = (x_pool1>0).sum() / x_pool1.nelement()
+        if self.train_predictor_only:
+            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
+            predictor_loss_func = torch.nn.MSELoss()
+            self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)  
+            return x_conv,x_conv ,None
         if self.predictor_warmup:
             # warmup stage, return undropped original data and empty data
-            return voxel_data, None
+            return x_conv, x_conv,None
 
         # -------- The Loss Calucation of the conf-map ----------
         # process the gt-heatmap
-        gt_heatmap = torch.sum(self.gt_heatmap[0],dim=1)
-        gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2)
+        gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+        gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
         predictor_loss_func = torch.nn.MSELoss()
-        self.predictor_loss = self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)
+        self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)
 
         # ----- criterions, how to hard prune from feature-map ------
         # TODO: threshold determination maybe?
@@ -174,7 +234,16 @@ class VoxelBackBone8x(nn.Module):
         # DEBUG: conf-map use relu as activation! therefor the min is 0, or not? need to try
         # DEBUG: how to deal with bs, DONOT div on bs, make it all be 0?
         # DEBUG: when designing drop_where_dummy, make sure not to include 0 for conf-value, cause the sparse bev value is 0, will result in empty point-cloud 
-        drop_where_dummy = torch.where(conf_map > conf_map.max()*0.01)  # tuple of 4 (BS,CH,W,H)
+        # TODO: make sparse-mask value as -1, criterion as threshold > conf_map > 0(min value after relu of predictor)
+        conf_map_reshape = conf_map.reshape(-1)
+        sparse_mask_reshape = sparse_mask_.reshape(-1)
+        conf_map_where_not_sparse = torch.nonzero(sparse_mask_reshape)
+        not_sparse_conf_map = torch.index_select(conf_map_reshape,0,conf_map_where_not_sparse.squeeze(1))
+        # conf_map_none_zero = torch.index_select(conf_map)
+        # drop_where_dummy = torch.where(((conf_map <= not_sparse_conf_map.median()) & (sparse_mask_!=0 )))  # tuple of 4 (BS,CH,W,H)
+        drop_where_dummy = torch.where(((conf_map >= conf_map.max()*0.5) & (conf_map > 0)))  # tuple of 4 (BS,CH,W,H)
+        # torch.where(conf_map > conf_map.max()*0.01) 
+        # drop_where_dummy = torch.where((conf_map < conf_map.median()*0.01) & (sparse_mask_!=0 )) 
         drop_dense_idx = []
         for drop_where_ in drop_where_dummy:
             drop_dense_idx.append(drop_where_)
@@ -185,48 +254,52 @@ class VoxelBackBone8x(nn.Module):
         #   - spconv sparse tensor, given the coord(indice), get the id/feature, gather-em
         #   - use from-dense function*  z-axis info all-lost, stupid as fuck
         # 2. drop the voxels(may need re-init sparse-tensor) TODO: check the grad
-        voxel_coords = voxel_data.indices[:,torch.LongTensor([0,2,3])]
+        voxel_coords = x_conv.indices[:,torch.LongTensor([0,2,3])]
         drop_dense_idx = drop_dense_idx[:,torch.LongTensor([0,2,3])]   # [K, 3]
         K,_ = drop_dense_idx.shape
         N,_ = voxel_coords.shape
 
-        GET_DROP_INDEX_SCHEME = 'para'
+        GET_DROP_INDEX_SCHEME = 'seq'
         # GET_DROP_INDEX_SCHEME = 'seq'
 
-        if GET_DROP_INDEX_SCHEME == 'para':
-            # FIXME: K could be very large, which result in huge mem usage
-            # Scheme 1:  parallel's K's matching
-            voxel_coords_ = voxel_coords
-            voxel_coords = torch.cat([voxel_coords[:,torch.LongTensor([0])] ,torch.div(voxel_coords[:,1:],voxel_data.spatial_shape[0]//voxel_data_pooled.spatial_shape[0],rounding_mode='floor')], dim=-1).unsqueeze(0)       # [1,N,3], be careful //8 with the bs will cause all bs-id to be 0
-            drop_dense_idx = drop_dense_idx.unsqueeze(1)   # [K,1,3]
-            # [K,N,3], VERY HUGE Tensor
-            diff = ((voxel_coords - drop_dense_idx)==0).sum(-1)  # [,N], DEBUG: could be large when drop lots of points*
-            ori_idx = torch.where(diff == 3)[0]
-            drop_idx = torch.where(diff == 3)[1]
-            # print(torch.unique(ori_idx).shape, drop_dense_idx.shape)   # check whether all dropped pixel have points within(should be)
-
-        elif GET_DROP_INDEX_SCHEME == 'seq':
-            # Scheme 2: sequential K's processing
-            voxel_coords = torch.cat([voxel_coords[:,torch.LongTensor([0])] ,torch.div(voxel_coords[:,1:],voxel_data.spatial_shape[0]//voxel_data_pooled.spatial_shape[0],rounding_mode='floor')], dim=-1)       # [1,N,3], be careful //8 with the bs will cause all bs-id to be 0
-            drop_idx = torch.cat([torch.where((drop_dense_idx[k_]==voxel_coords).sum(-1) == 3)[0] for k_ in range(K)])
+        if K == 0:
+            # PASS: donot drop point
+            return x_conv, x_conv,None
         else:
-            raise NotImplementedError
+            if GET_DROP_INDEX_SCHEME == 'para':
+                # FIXME: K could be very large, which result in huge mem usage
+                # Scheme 1:  parallel's K's matching
+                voxel_coords_ = voxel_coords
+                voxel_coords = torch.cat([voxel_coords[:,torch.LongTensor([0])] ,torch.div(voxel_coords[:,1:],x_conv.spatial_shape[0]//x_pool_.spatial_shape[0],rounding_mode='floor')], dim=-1).unsqueeze(0)       # [1,N,3], be careful //8 with the bs will cause all bs-id to be 0
+                drop_dense_idx = drop_dense_idx.unsqueeze(1)   # [K,1,3]
+                # [K,N,3], VERY HUGE Tensor
+                diff = ((voxel_coords - drop_dense_idx)==0).sum(-1)  # [K,N], DEBUG: could be large when drop lots of points*
+                ori_idx = torch.where(diff == 3)[0]
+                drop_idx = torch.where(diff == 3)[1]
+                # print(torch.unique(ori_idx).shape, drop_dense_idx.shape)   # check whether all dropped pixel have points within(should be)
 
-        idx = torch.arange(N, device=voxel_data.features.device)
-        drop_mask = torch.ones(N, device=voxel_data.features.device)
-        drop_mask[drop_idx] = 0
-        kept_idx = torch.masked_select(idx, drop_mask.bool())
+            elif GET_DROP_INDEX_SCHEME == 'seq':
+                # Scheme 2: sequential K's processing
+                voxel_coords = torch.cat([voxel_coords[:,torch.LongTensor([0])] ,torch.div(voxel_coords[:,1:],x_conv.spatial_shape[0]//x_pool_.spatial_shape[0],rounding_mode='floor')], dim=-1)       # [1,N,3], be careful //8 with the bs will cause all bs-id to be 0
+                drop_idx = torch.cat([torch.where((drop_dense_idx[k_]==voxel_coords).sum(-1) == 3)[0] for k_ in range(K)])
+            else:
+                raise NotImplementedError
 
-        indices = torch.index_select(voxel_data.indices,0,kept_idx)
-        features = torch.index_select(voxel_data.features,0,kept_idx)
-        new_voxel_data = spconv.SparseConvTensor(
-                features=features,
-                indices=indices.int(),
-                spatial_shape=voxel_data.spatial_shape,
-                batch_size=voxel_data.batch_size,
-                )
+            idx = torch.arange(N, device=x_conv.features.device)
+            drop_mask = torch.ones(N, device=x_conv.features.device)
+            drop_mask[drop_idx] = 0
+            kept_idx = torch.masked_select(idx, drop_mask.bool())
 
-        return new_voxel_data, drop_idx
+            indices = torch.index_select(x_conv.indices,0,kept_idx)
+            features = torch.index_select(x_conv.features,0,kept_idx)
+            new_voxel_data = spconv.SparseConvTensor(
+                    features=features,
+                    indices=indices.int(),
+                    spatial_shape=x_conv.spatial_shape,
+                    batch_size=x_conv.batch_size,
+                    )
+
+            return new_voxel_data, x_conv,drop_idx
 
     def forward(self, batch_dict):
         """
@@ -248,42 +321,19 @@ class VoxelBackBone8x(nn.Module):
             batch_size=batch_size
         )
 
-        x = self.conv_input(input_sp_tensor)
+        x = self.conv_input(input_sp_tensor) #may cause nan
+
+        # print('Cur input feature',x.features[0,:])  # [N,C]: reproducibility test, failed
 
         if self.use_predictor:
             self.predictor_loss = 0. # re-init the predictor loss after each iter
-
-            # TODO: when using the scheme used in backbone2d/map_to_bev/transform to x.dense() 
-            # then reshape on z-axis, too much mem-comsumption: 
-            # solved by applying Pooling before generating feature map, 
-            # however, only max-pool is introduced, avgpool would be more reasonable, use maxpool for now
-            conf_maps = []
-            x_conv1 = self.conv1(x)
-            x_pool1_ = self.pool1(x_conv1)  # use pooling to pool all-levels of feature to the last dim(conv_4); TODO: the max-pool also pools the Z-axis feature harshly
-            x_pool1 = x_pool1_.dense()  # use pooling to pool all-levels of feature to the last dim(conv_4); TODO: the max-pool also pools the Z-axis feature harshly
-            N,C,D,W,H=x_pool1.shape                # concat the Z-axis to channel-dims,2-d HeatMap: [N,C,W,H]
-            x_pool1_bak = x_pool1
-            x_pool1 = x_pool1.reshape([N,-1,W,H])
-            x_pool1 = torch.repeat_interleave(x_pool1,4,dim=1)
-            # the input of the predictor have different channel-shapes, should view it to the biggest channel-size
-
-            # DEBUG_ONLY
-            # import ipdb; ipdb.set_trace()
-            # for i in range(x_pool1_.indices.shape[0]):
-                # indices = x_pool1_.indices[i,2:]
-                # if not (x_pool1[:,:,indices[0],indices[1]].sum()>0):
-                    # print('{}-th point not in bev'.format(i))
-
-            conf_map1 = self.predictor_forward(x_pool1)    # gen conf-map: [N,1,W,H]
-            x_pool1, sparse_map1 = self.drop_voxel(x_pool1, conf_map1, x_conv1, x_pool1_)
-
-            x_conv2 = self.conv2(x_pool1)
-            x_pool2_ = self.pool2(x_conv2)
-            x_pool2 = x_pool2_.dense()
-            x_pool2 = x_pool2.reshape([N,-1,W,H])
-            x_pool2 = torch.repeat_interleave(x_pool2,2,dim=1)
-            conf_map2 = self.predictor_forward(x_pool2)
-            x_pool2, sparse_map2 = self.drop_voxel(x_pool2, conf_map2, x_conv2, x_pool2_)
+            # print('Sparse Ratio: conf_map:{:.3f}, predictor-out:{:.3f}, sparse-mask:{:.3f}, x_pool1 {:.3f},x-conv1-max:{}'\
+                    # .format(conf_map1_sparse_ratio, out_sparse_ratio, sparse_mask_1_sparse_ratio, x_pool1_sparse_ratio, x_conv1.features.abs().max()))
+            # x_pool1, sparse_map1 = self.drop_voxel(sparse_mask_1, conf_map1, x_conv1, x_pool1_)
+            x_pool1,x_conv1 ,sparse_map1 = self.drop_voxel(x, batch_dict['frame_id'], 0)
+            x_pool2,x_conv2 ,sparse_map2 = self.drop_voxel(x_pool1, batch_dict['frame_id'], 1)
+            # print(x_conv1.features.shape[0], x_pool1.features.shape[0])
+            self.save_dict['loss'] =  self.predictor_loss
 
             x_conv3 = self.conv3(x_pool2)
             x_conv4 = self.conv4(x_conv3)
@@ -319,7 +369,7 @@ class VoxelBackBone8x(nn.Module):
 
         # for detection head
         # [200, 176, 5] -> [200, 176, 2]
-        out = self.conv_out(x_conv4)
+        out = self.conv_out(x_conv4)#出现没有元素
 
         batch_dict.update({
             'encoded_spconv_tensor': out,
