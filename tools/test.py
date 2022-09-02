@@ -195,9 +195,13 @@ def main():
             repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=dist_test)
         else:
             eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id, dist_test=dist_test)
+    # d={}
+    # d['loc_lss_list'] = model.dense_head.loc_lss_list
+    # torch.save(d, f"/home/nfs_data/lupu/CenterPoint-KITTI/tools/visualization/loc_lss_list_{model.dense_head.vfe_config['NAME']}{model.dense_head.vfe_config['VOXEL_PERCENT']}.pth")
     d={}
-    d['loc_lss_list'] = model.dense_head.loc_lss_list
-    torch.save(d, f"/home/nfs_data/lupu/CenterPoint-KITTI/tools/visualization/loc_lss_list_{model.dense_head.vfe_config['NAME']}{model.dense_head.vfe_config['VOXEL_PERCENT']}.pth")
+    d['drop_ratio1'] = model.module_list[1].drop_ratio1
+    d['drop_ratio2'] = model.module_list[1].drop_ratio2
+    torch.save(d, f"/home/nfs_data/lupu/CenterPoint-KITTI/tools/visualization/median_drop_ratio_r{model.radius}.pth")
 
 if __name__ == '__main__':
     main()

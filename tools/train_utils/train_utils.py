@@ -7,12 +7,15 @@ from torch.nn.utils import clip_grad_norm_
 
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
-                    rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False):
+                    rank, tbar, total_it_each_epoch, dataloader_iter,cur_epoch, tb_log=None, leave_pbar=False):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
     if rank == 0:
         pbar = tqdm.tqdm(total=total_it_each_epoch, leave=leave_pbar, desc='train', dynamic_ncols=True)
+
+    # DEBUG_ONLY!!!!
+    # total_it_each_epoch = 500
 
     for cur_it in range(total_it_each_epoch):
         try:
@@ -21,9 +24,12 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             dataloader_iter = iter(train_loader)
             batch = next(dataloader_iter)
             print('new iters')
-
         lr_scheduler.step(accumulated_iter)
 
+        batch['cur_it'] = cur_it
+        batch['itera_each_epoch'] = total_it_each_epoch
+        batch['cur_epoch'] = cur_epoch
+        batch['total_iteration'] = cur_epoch*total_it_each_epoch + cur_it
         try:
             cur_lr = float(optimizer.lr)
         except:
@@ -35,13 +41,22 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         model.train()
         optimizer.zero_grad()
 
-        loss, tb_dict, disp_dict = model_func(model, batch)
+        loss, tb_dict, disp_dict,ret_dict = model_func(model, batch)
+        # break
+        disp_dict.update({'loss': loss.item(), 'lr': cur_lr})
+        if 'predictor_loss' in ret_dict.keys():
+            disp_dict.update({'predictor_loss': ret_dict['predictor_loss'].item()})
+            # statics_of_drop_voxel = {'voxels_number': model.module_list[1].voxels_number, 'drop_voxels_number':model.module_list[1].drop_voxels_number ,
+            # 'voxels_in_boxes_number':model.module_list[1].voxels_in_boxes_number ,'drop_voxels_in_boxes_number':model.module_list[1].drop_voxels_in_boxes_number ,}
+            loss += ret_dict['predictor_loss']
+            if model.module_list[1].skip_drop_voxel:
+                loss = ret_dict['predictor_loss']
         loss.backward()
         clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
         optimizer.step()
 
         accumulated_iter += 1
-        disp_dict.update({'loss': loss.item(), 'lr': cur_lr})
+        
 
         # log to console and tensorboard
         if rank == 0:
@@ -49,7 +64,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             pbar.set_postfix(dict(total_it=accumulated_iter))
             tbar.set_postfix(disp_dict)
             tbar.refresh()
-
+            # print(statics_of_drop_voxel)
             if tb_log is not None:
                 tb_log.add_scalar('train/loss', loss, accumulated_iter)
                 tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
@@ -59,7 +74,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         pbar.close()
     # d={}
     # d['loc_lss_list'] = model.dense_head.loc_lss_list
-    # torch.save(d, f"./visualization/loc_lss_list_{model.dense_head.vfe_config['NAME']}{model.dense_head.vfe_config['VOXEL_PERCENT']}.pth")
+    # torch.save(model.module_list[1].save_dict, f"./visualization/predictor_epoch{}.pth")
     # model.dense_head.loc_lss_list
     # exit()
     return accumulated_iter
@@ -87,16 +102,18 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 cur_scheduler = lr_warmup_scheduler
             else:
                 cur_scheduler = lr_scheduler
-            accumulated_iter = train_one_epoch(
-                model, optimizer, train_loader, model_func,
-                lr_scheduler=cur_scheduler,
-                accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
-                rank=rank, tbar=tbar, tb_log=tb_log,
-                leave_pbar=(cur_epoch + 1 == total_epochs),
-                total_it_each_epoch=total_it_each_epoch,
-                dataloader_iter=dataloader_iter
-            )
-
+            if True:
+                accumulated_iter = train_one_epoch(
+                    model, optimizer, train_loader, model_func,
+                    lr_scheduler=cur_scheduler,
+                    accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
+                    rank=rank, tbar=tbar, tb_log=tb_log,
+                    leave_pbar=(cur_epoch + 1 == total_epochs),
+                    total_it_each_epoch=total_it_each_epoch,
+                    dataloader_iter=dataloader_iter,
+                    cur_epoch = cur_epoch
+                )
+            # model.module_list[1].train_epoch +=1
             # save trained model
             trained_epoch = cur_epoch + 1
             if trained_epoch % ckpt_save_interval == 0 and rank == 0:
@@ -112,6 +129,19 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 save_checkpoint(
                     checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
                 )
+
+            # TODO: model-save-dict: SAVE the intermediate results
+            # save every epoch: pack as a dict, each element is a list
+            # mean within each epoch. append for each epoch
+            # get the model.save_dict here and save to output log
+
+            # statics_of_drop_voxel = {'voxels_number': model.module_list[1].voxels_number, 'drop_voxels_number':model.module_list[1].drop_voxels_number ,
+            # 'voxels_in_boxes_number':model.module_list[1].voxels_in_boxes_number ,'drop_voxels_in_boxes_number':model.module_list[1].drop_voxels_in_boxes_number ,}
+            # torch.save(statics_of_drop_voxel, f"./visualization/multiconv/predictor_r{model.radius}_wd{optim_cfg.WEIGHT_DECAY}_lr{optim_cfg.LR}_epoch{cur_epoch}.pth")
+            save_d= {**model.module_list[1].save_dict, **model.save_dict}
+            # reload / mean*
+            torch.save(save_d, os.path.join(ckpt_save_dir,'../','saved.pth'))
+            # import ipdb; ipdb.set_trace()
 
 
 def model_state_to_cpu(model_state):

@@ -101,8 +101,10 @@ def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
 
 
 def keep_arrays_by_name(gt_names, used_classes):

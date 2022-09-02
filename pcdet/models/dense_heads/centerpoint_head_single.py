@@ -120,7 +120,7 @@ class CenterHead(nn.Module):
             feat = feat.view(-1, dim)
         return feat
 
-    def assign_targets(self, gt_boxes):
+    def assign_targets(self, gt_boxes,radiu = None):
         """Generate targets.
 
         Args:
@@ -139,9 +139,11 @@ class CenterHead(nn.Module):
                         boxes are valid.
         """
         gt_bboxes_3d, gt_labels_3d = gt_boxes[..., :-1], gt_boxes[..., -1]
-
+        radius=[]
+        for i in range(gt_bboxes_3d.shape[0]):
+            radius.append(radiu)
         heatmaps, anno_boxes, inds, masks = multi_apply(
-            self.get_targets_single, gt_bboxes_3d, gt_labels_3d)
+            self.get_targets_single, gt_bboxes_3d, gt_labels_3d,radius)
         # transpose heatmaps, because the dimension of tensors in each task is
         # different, we have to use numpy instead of torch to do the transpose.
         heatmaps = np.array(heatmaps).transpose(1, 0).tolist()
@@ -165,7 +167,7 @@ class CenterHead(nn.Module):
         
         return all_targets_dict
 
-    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d):
+    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d,radius):
         """Generate training targets for a single sample.
 
         Args:
@@ -251,10 +253,11 @@ class CenterHead(nn.Module):
                 length = length / voxel_size[1] / self.target_cfg.OUT_SIZE_FACTOR
 
                 if width > 0 and length > 0:
-                    radius = gaussian_radius(
-                        (length, width),
-                        min_overlap=self.target_cfg.GAUSSIAN_OVERLAP)
-                    radius = max(self.target_cfg.MIN_RADIUS, int(radius))
+                    if radius is None:
+                        radius = gaussian_radius(
+                            (length, width),
+                            min_overlap=self.target_cfg.GAUSSIAN_OVERLAP)
+                        radius = max(self.target_cfg.MIN_RADIUS, int(radius))
 
                     # be really careful for the coordinate system of
                     # your box annotation.
@@ -396,12 +399,16 @@ class CenterHead(nn.Module):
         code_weights = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['code_weights']
         bbox_weights = mask * mask.new_tensor(code_weights)
         
-        loc_loss = l1_loss(
-            pred, target_box, bbox_weights,reduction='none' ,avg_factor=(num + 1e-4))
+        # loc_loss = l1_loss(
+            # pred, target_box, bbox_weights,reduction='none' ,avg_factor=(num + 1e-4))
         #avg_factor=(num + 1e-4)
+        # loc_loss = loc_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
+        # self.loc_lss_list.append(loc_loss)
+        # loc_loss = loc_loss.sum() / (num + 1e-4)
+    
+        loc_loss = l1_loss(
+            pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
         loc_loss = loc_loss * self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['loc_weight']
-        self.loc_lss_list.append(loc_loss)
-        loc_loss = loc_loss.sum() / (num + 1e-4)
         box_loss = loc_loss
         tb_dict = {
             'rpn_loss_loc': loc_loss.item()

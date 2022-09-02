@@ -55,6 +55,14 @@ def eval_one_epoch(cfg, model, dataloader, epoch_id, logger, dist_test=False, sa
         # if i < 471:
         #     progress_bar.update()
         #     continue
+        #useless, large to make sure right drop-voxel
+        cur_it = 1e10 
+        total_it_each_epoch = 1e10
+        cur_epoch = 1e10
+        batch_dict['cur_it'] = cur_it
+        batch_dict['itera_each_epoch'] = total_it_each_epoch
+        batch_dict['cur_epoch'] = cur_epoch
+        batch_dict['total_iteration'] = cur_epoch*total_it_each_epoch + cur_it
         load_data_to_gpu(batch_dict)
         with torch.no_grad():
             pred_dicts, ret_dict = model(batch_dict)

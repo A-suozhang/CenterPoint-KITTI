@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+
+from pcdet.models.dense_heads.centerpoint_head_single import GaussianFocalLoss
+
 
 def post_act_block(in_channels, out_channels, kernel_size, indice_key=None, stride=1, padding=0,
                    conv_type='subm', norm_fn=None):
@@ -73,7 +77,34 @@ class VoxelBackBone8x(nn.Module):
         self.model_cfg = model_cfg
         norm_fn = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
         self.i=0
+
+        # define what needs to be stored for save_dict
         self.save_dict={}
+        save_variable_names = ['predictor_loss']
+        for level_ in range(2): # levels
+            for name in ['n_voxel','n_drop_voxel','n_voxel_inbox','n_drop_voxel_inbox']:  # multi-level varaibles to save
+                save_variable_names.append(name+'_L{}'.format(level_))
+        print(save_variable_names)
+        for name in save_variable_names:
+            self.save_dict[name] = []
+        self.save_dict['maps'] = {}
+
+
+        # self.train_epoch=0
+        self.skip_drop_epoch = kwargs['SKIP_DROP_EPOCH']
+        self.drop_ratio1=[]
+        self.drop_ratio2=[]
+        self.voxel_size = kwargs['voxel_size']
+        self.point_cloud_range = kwargs['point_cloud_range']
+        self.OUT_SIZE_FACTOR =  kwargs['OUT_SIZE_FACTOR']
+
+        self.voxels_number = 0
+        self.drop_voxels_number = 0
+        self.voxels_in_boxes_number=0
+        self.drop_voxels_in_boxes_number= 0
+
+
+
         # ----- the predictor related configs ------
         # TODO: feature-based predictor design
         # Input: [N, C] voxel features -> Project to BEV
@@ -86,8 +117,17 @@ class VoxelBackBone8x(nn.Module):
         # 1. voxel-drop-criterion (plus spatial priors), also loss calc logic here
         self.use_predictor = self.model_cfg['use_predictor'] if 'use_predictor' in self.model_cfg.keys() else False
          # make it a global switch for whether use the predictor or not, change it in `train.py`, reading the config and turn it on at certain epoch
-        self.predictor_warmup = False
+
+        # -----------  CFGS for predictor ----------
+        # self.predictor_warmup = False
+        # self.mask_predictor_output = self.model_cfg['mask_predictor_output'] if 'mask_predictor_output' in self.model_cfg.keys() else False # mask-predictor output, so only the places with voxels give supervision
+        self.mask_predictor_output = False
+        self.predictor_loss_type = 'gaussian_focal'   # choose the predictor-loss type, could be in cfg
+        self.drop_type = 'median'   # choose the predictor-loss type, could be in cfg
         self.train_predictor_only = True
+        self.skip_drop_voxel = True        # no drop-voxel
+        self.only_conv = False
+        self.multi_conv = True
         if self.use_predictor:
             self.pools = nn.ModuleList([
                 spconv.SparseMaxPool3d(kernel_size=8),
@@ -102,8 +142,22 @@ class VoxelBackBone8x(nn.Module):
                 # nn.Conv2d(4*times*5,1,kernel_size=5,padding='same'),
                 # nn.ReLU(),
                     # )
-            self.predictor_conv = nn.Conv2d(4*times*5,1,kernel_size=5,padding='same')
-            self.predictor_bn = nn.BatchNorm2d(1)
+            if self.only_conv:
+                self.predictor_conv = nn.Conv2d(4*times*5,1,kernel_size=5,padding='same')
+                self.predictor_bn = nn.BatchNorm2d(1)
+            elif self.multi_conv:
+                self.predictor_conv1 = nn.Conv2d(4*times*5,64,kernel_size=5,padding='same')
+                self.predictor_conv2 = nn.Conv2d(64,16,kernel_size=5,padding='same')
+                self.predictor_conv3 = nn.Conv2d(16,8,kernel_size=3,padding='same')
+                self.predictor_bn1 = nn.BatchNorm2d(64)
+                self.predictor_bn2 = nn.BatchNorm2d(16)
+                self.predictor_bn3 = nn.BatchNorm2d(8)
+                self.predictor_conv = nn.ModuleList([
+                    self.predictor_conv1,
+                    self.predictor_conv2,
+                    self.predictor_conv3,
+                ])
+
             self.predictor_nonlinear = nn.Sigmoid()
             # Input [x_conv3(max-channel-output)*Z-axis-size]
             # kernel-size should roughly be like the gaussian kernel(TODO: need deiciding)
@@ -165,7 +219,67 @@ class VoxelBackBone8x(nn.Module):
         # out = out*sparse_mask_
         # return out
 
-    def drop_voxel(self, x,frame_id,level):#sparse_mask_, conf_map, voxel_data, voxel_data_pooled)
+    def in_box_voxel(self,voxels,batch_dict,div_number):
+        # voxels: Coords [N,4]
+        # batch-dict
+        # div-number: downsample rate
+        voxel_coords = torch.cat([voxels[:,0:1] ,torch.div(voxels[:,1:],div_number,rounding_mode='floor')], dim=-1)
+        point_cloud_range = self.point_cloud_range
+        voxel_size = self.voxel_size
+        pc_range = torch.tensor(point_cloud_range)
+        voxel_size = torch.tensor(voxel_size)
+        gt_boxes = batch_dict['gt_boxes']
+        # INFO: a little dirty
+        # ---------------------------------------------------------
+        # we project the voxel into [200, 150]
+        # howver, the gt-box and gt-heatmap is in [400, 300](a deconv upsample in 2d-backbone)
+        # in order to align, we make both of it be in [200, 150] space, thus /self.OUT_SIZE_FACTOR/2
+        # ----------------------------------------------------------
+        coor_centerx = (gt_boxes[:,:,0] - pc_range[0]) / voxel_size[0] /self.OUT_SIZE_FACTOR/2
+        coor_centery = (gt_boxes[:,:,1] - pc_range[1]) / voxel_size[1] /self.OUT_SIZE_FACTOR/2
+        coor_centerz = (gt_boxes[:,:,2] - pc_range[2]) / voxel_size[2] /self.OUT_SIZE_FACTOR/2
+        coor_x = (gt_boxes[:,:,3]) / voxel_size[0] /self.OUT_SIZE_FACTOR/2
+        coor_y = (gt_boxes[:,:,4]) / voxel_size[1] /self.OUT_SIZE_FACTOR/2
+        coor_z = (gt_boxes[:,:,5]) / voxel_size[2] /self.OUT_SIZE_FACTOR/2
+        # rotation = (-(gt_boxes[:,:,6]+np.pi/2))%np.pi
+        rotation = gt_boxes[:,:,6]
+        num_inboxes = 0
+        # keep_index_list_total =[]
+        # voxel_batch_list = []
+        for i in range(batch_dict['batch_size']):
+            label = gt_boxes[i,:,7]
+            index_list = torch.nonzero(label.int()!= 0).squeeze()
+            coor_centerx_batch = torch.index_select(coor_centerx[i],0,index_list)
+            coor_centery_batch = torch.index_select(coor_centery[i],0,index_list)
+            coor_centerz_batch = torch.index_select(coor_centerz[i],0,index_list)
+            coor_x_batch = torch.index_select(coor_x[i],0,index_list)
+            coor_y_batch = torch.index_select(coor_y[i],0,index_list)
+            coor_z_batch = torch.index_select(coor_z[i],0,index_list)
+            rotation_batch = - torch.index_select(rotation[i],0,index_list)
+            coor_box =torch.stack((coor_centerz_batch,coor_centery_batch,coor_centerx_batch,rotation_batch,
+                                                                    coor_z_batch,coor_y_batch,coor_x_batch),dim=1)
+            index_list = torch.nonzero(voxel_coords[:,0].int()== i).squeeze(dim = 1)
+            if index_list.shape[0]== 0 :
+                continue
+            batch_start = index_list[0]
+            voxel_coords_batch= torch.index_select(voxel_coords, 0, index_list)
+            coor_box1 = torch.unsqueeze(coor_box, dim=1)
+            voxel_coords_batch1 = torch.unsqueeze(voxel_coords_batch[:,1:],dim=0)
+            voxel_coords_batch1 = voxel_coords_batch1 - coor_box1[:,:,0:3]
+            voxels_coord_y = voxel_coords_batch1[:,:,2]*torch.sin(coor_box1[:,:,3]) + voxel_coords_batch1[:,:,1]*torch.cos(coor_box1[:,:,3])
+            voxels_coord_x = -voxel_coords_batch1[:,:,1]*torch.sin(coor_box1[:,:,3]) + voxel_coords_batch1[:,:,2]*torch.cos(coor_box1[:,:,3])
+            voxel_coords_batch1[:,:,1]=voxels_coord_y
+            voxel_coords_batch1[:,:,2] = voxels_coord_x
+            in_bool1 = (voxel_coords_batch1[:,:,1] <= (coor_box1[:,:,5]+1)/2) & (voxel_coords_batch1[:,:,1] >= -(coor_box1[:,:,5]+1)/2) \
+            &(voxel_coords_batch1[:,:,2] <= (coor_box1[:,:,6]+1)/2) & (voxel_coords_batch1[:,:,2] >= -(coor_box1[:,:,6]+1)/2)\
+            &(voxel_coords_batch1[:,:,0]<=(coor_box1[:,:,4]+1)/2)&(voxel_coords_batch1[:,:,0]>=-(coor_box1[:,:,4]+1)/2)
+            in_bool1 = torch.any(in_bool1, 0)
+            num_inboxes += in_bool1.sum(-1)
+        # print(num_inboxes/voxel_coords.shape[0])
+        return num_inboxes
+
+    def drop_voxel(self, x,frame_id,level,batch_dict):#sparse_mask_, conf_map, voxel_data, voxel_data_pooled)
+
         x_conv = self.conv_list[level](x)
         if torch.isnan(x.features).sum()>0:
             print('X Nan Here!')
@@ -182,51 +296,107 @@ class VoxelBackBone8x(nn.Module):
         pool_size = 4//(level+1)
         x_pool = torch.repeat_interleave(x_pool,pool_size,dim=1)
         sparse_mask_ = (x_pool.sum(dim=1).unsqueeze(1) != 0).int()
-        out1 = self.predictor_conv(x_pool)
-        out1_bn = self.predictor_bn(out1)
-        out = self.predictor_nonlinear(out1)
-        conf_map = out*sparse_mask_
-        if frame_id[0]=='000000':
-            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
-            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
-            self.save_dict['input'] = x_pool[0]
-            self.save_dict['pre-bn'] = out1[0]
-            self.save_dict['post-bn'] = out1_bn[0]
-            self.save_dict['post-nonlinear'] = out[0]
-            self.save_dict['sparse-mask'] = sparse_mask_[0]
-            self.save_dict['gt_heatmap'] = gt_heatmap[0]
-            torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
-        if frame_id[1]=='000000':
-            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
-            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2)
-            self.save_dict['input'] = x_pool[1]
-            self.save_dict['pre-bn'] = out1[1]
-            self.save_dict['post-bn'] = out1_bn[1]
-            self.save_dict['post-nonlinear'] = out[1]
-            self.save_dict['sparse-mask'] = sparse_mask_[1]
-            self.save_dict['gt_heatmap'] = gt_heatmap[0]
-            torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
-            # DEBUG_ONLY:
-            # conf_map1_sparse_ratio = (conf_map1 > 0).sum() / conf_map1.nelement()
-            # out_sparse_ratio = (out > 0).sum() / out.nelement()
-            # sparse_mask_1_sparse_ratio = (sparse_mask_1 > 0).sum() / sparse_mask_1.nelement()
-            # x_pool1_sparse_ratio = (x_pool1>0).sum() / x_pool1.nelement()
-        if self.train_predictor_only:
-            gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
-            gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
-            predictor_loss_func = torch.nn.MSELoss()
-            self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)  
-            return x_conv,x_conv ,None
-        if self.predictor_warmup:
+        if self.only_conv:
+            out1 = self.predictor_conv(x_pool)
+            out1_bn = self.predictor_bn(out1)
+            out = self.predictor_nonlinear(out1)
+        if self.multi_conv:
+            out1 = self.predictor_conv1(x_pool)
+            out1_bn = self.predictor_bn1(out1)
+            out1 = self.predictor_nonlinear(out1_bn)
+            out2 = self.predictor_conv2(out1)
+            out2_bn = self.predictor_bn2(out2)
+            out2 = self.predictor_nonlinear(out2_bn)
+            out3 = self.predictor_conv3(out2)
+            out3_bn = self.predictor_bn3(out3)
+            out3 = self.predictor_nonlinear(out3_bn)
+            out = torch.mean(out3,dim=1).unsqueeze(1)    #[bs,1,W,H]
+
+        if self.mask_predictor_output:
+            conf_map = out*sparse_mask_  # DEBUG: whether to mask grad of places that donot have voxels
+        else:
+            conf_map = out
+
+        # DEBUG_ONLY: save heatmaps for certain scenes
+        frames_to_save = ['000000','000285', '001532', '003376', '005875','000845', '007429', '002738', '002235']
+        for frame_name in frames_to_save:
+            if np.where(frame_id == frame_name)[0].any():
+                idx_batch = int(np.where(frame_id == frame_name)[0])
+                #self.save_dict['input'] = x_pool[0]
+                #self.save_dict['pre-bn'] = out1[0]
+                #self.save_dict['post-bn'] = out1_bn[0]
+                #self.save_dict['post-nonlinear'] = out[0]
+                #self.save_dict['sparse-mask'] = sparse_mask_[0]
+                gt_heatmap = torch.sum(self.gt_heatmap[0],dim=1)
+                gt_heatmap = F.max_pool2d(gt_heatmap, kernel_size=2)
+                gt_heatmap = gt_heatmap.unsqueeze(1)
+                self.save_dict['maps'][frame_name] = torch.stack([conf_map[idx_batch],gt_heatmap[idx_batch],sparse_mask_[idx_batch]],dim=0)  # [3, W, H]
+
+                # self.save_dict['conf_map'][frame_name] = conf_map[idx_batch]
+                # self.save_dict['gt_heatmap'][frame_name] = gt_heatmap[idx_batch]
+                # self.save_dict['sparse_map'][frame_name] = sparse_mask_[idx_batch]
+
+
+        # if frame_id[0]=='000000':
+            # gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+            # gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
+            # #self.save_dict['input'] = x_pool[0]
+            # #self.save_dict['pre-bn'] = out1[0]
+            # #self.save_dict['post-bn'] = out1_bn[0]
+            # #self.save_dict['post-nonlinear'] = out[0]
+            # self.save_dict['conf_map'] = conf_map[0]
+            # #self.save_dict['sparse-mask'] = sparse_mask_[0]
+            # self.save_dict['gt_heatmap'] = gt_heatmap[0]
+            # # torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
+            # # exit()
+        # if frame_id[1]=='000000':
+            # gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+            # gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2)
+            # #self.save_dict['input'] = x_pool[1]
+            # #self.save_dict['pre-bn'] = out1[1]
+            # #self.save_dict['post-bn'] = out1_bn[1]
+            # #self.save_dict['post-nonlinear'] = out[1]
+            # self.save_dict['conf_map'] = conf_map[1]
+            # #self.save_dict['sparse-mask'] = sparse_mask_[1]
+            # self.save_dict['gt_heatmap'] = gt_heatmap[1]
+            # # torch.save(self.save_dict, f"./visualization/predictor/predictor_GT.pth")
+            # # exit()
+            # # DEBUG_ONLY:
+            # # conf_map1_sparse_ratio = (conf_map1 > 0).sum() / conf_map1.nelement()
+            # # out_sparse_ratio = (out > 0).sum() / out.nelement()
+            # # sparse_mask_1_sparse_ratio = (sparse_mask_1 > 0).sum() / sparse_mask_1.nelement()
+            # # x_pool1_sparse_ratio = (x_pool1>0).sum() / x_pool1.nelement()
+
+        
+        # if self.skip_drop_voxel:
+        #     if self.train_epoch<16:
+        #         gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
+        #         gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
+        #         predictor_loss_func = torch.nn.MSELoss()
+        #         self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)  
+        #         return x_conv,x_conv ,None
+
+        # if self.predictor_warmup:
             # warmup stage, return undropped original data and empty data
-            return x_conv, x_conv,None
+            # return x_conv, x_conv,None
 
         # -------- The Loss Calucation of the conf-map ----------
         # process the gt-heatmap
-        gt_heatmap = torch.mean(self.gt_heatmap[0],dim=1)
-        gt_heatmap = F.avg_pool2d(gt_heatmap, kernel_size=2) 
-        predictor_loss_func = torch.nn.MSELoss()
-        self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)
+        gt_heatmap = torch.sum(self.gt_heatmap[0],dim=1)   # mean would cause too-small peak value, use sum to maintain 1
+        gt_heatmap = F.max_pool2d(gt_heatmap, kernel_size=2) # avgpool2d will make the max being 0.5
+
+        if self.predictor_loss_type == 'mse':
+            predictor_loss_func = torch.nn.MSELoss()
+            self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap)
+        # elif self.predictor_loss_type == 'bce':
+            # predictor_loss_func = torch.nn.BCELoss(weight=None)
+        elif self.predictor_loss_type == 'gaussian_focal':
+            num_pos = batch_dict['gt_boxes'].shape[1]  # num-boxes 
+            predictor_loss_func = GaussianFocalLoss(reduction='mean')
+            self.predictor_loss += self.predictor_loss_lambda*predictor_loss_func(conf_map, gt_heatmap, avg_factor=max(num_pos, 1))
+        else:
+            raise NotImplementedError
+
 
         # ----- criterions, how to hard prune from feature-map ------
         # TODO: threshold determination maybe?
@@ -234,20 +404,26 @@ class VoxelBackBone8x(nn.Module):
         # DEBUG: conf-map use relu as activation! therefor the min is 0, or not? need to try
         # DEBUG: how to deal with bs, DONOT div on bs, make it all be 0?
         # DEBUG: when designing drop_where_dummy, make sure not to include 0 for conf-value, cause the sparse bev value is 0, will result in empty point-cloud 
-        # TODO: make sparse-mask value as -1, criterion as threshold > conf_map > 0(min value after relu of predictor)
         conf_map_reshape = conf_map.reshape(-1)
         sparse_mask_reshape = sparse_mask_.reshape(-1)
         conf_map_where_not_sparse = torch.nonzero(sparse_mask_reshape)
         not_sparse_conf_map = torch.index_select(conf_map_reshape,0,conf_map_where_not_sparse.squeeze(1))
         # conf_map_none_zero = torch.index_select(conf_map)
-        # drop_where_dummy = torch.where(((conf_map <= not_sparse_conf_map.median()) & (sparse_mask_!=0 )))  # tuple of 4 (BS,CH,W,H)
-        drop_where_dummy = torch.where(((conf_map >= conf_map.max()*0.5) & (conf_map > 0)))  # tuple of 4 (BS,CH,W,H)
+
+
+        if self.drop_type == 'median':
+            drop_where_dummy = torch.where(((conf_map <= not_sparse_conf_map.median()) & (sparse_mask_!=0 )))  # tuple of 4 (BS,CH,W,H)
+        elif self.drop_type == 'max_based':
+            drop_where_dummy = torch.where(((conf_map <= not_sparse_conf_map.abs().max()*0.7) & (sparse_mask_!=0 )))  # tuple of 4 (BS,CH,W,H)
+        elif self.drop_type == 'constant':
+            drop_where_dummy = torch.where(((conf_map <= 0.65) & (sparse_mask_!=0 )))  # tuple of 4 (BS,CH,W,H)
+        else:
+            raise NotImplementedError
+
+        # drop_where_dummy = torch.where(((conf_map >= conf_map.max()*0.5) & (conf_map > 0)))  # tuple of 4 (BS,CH,W,H)
         # torch.where(conf_map > conf_map.max()*0.01) 
         # drop_where_dummy = torch.where((conf_map < conf_map.median()*0.01) & (sparse_mask_!=0 )) 
-        drop_dense_idx = []
-        for drop_where_ in drop_where_dummy:
-            drop_dense_idx.append(drop_where_)
-        drop_dense_idx = torch.stack(drop_dense_idx,dim=-1)  # [K,4(bs,Z,W,H)]
+        drop_dense_idx = torch.stack([drop_where_ for drop_where_ in drop_where_dummy],dim=-1)
 
         # TODO: the actual drop process, drop the voxel
         # 1. find the correspondance (BEV - sparse-voxel)
@@ -261,7 +437,7 @@ class VoxelBackBone8x(nn.Module):
 
         GET_DROP_INDEX_SCHEME = 'seq'
         # GET_DROP_INDEX_SCHEME = 'seq'
-
+        # import ipdb; ipdb.set_trace()
         if K == 0:
             # PASS: donot drop point
             return x_conv, x_conv,None
@@ -288,7 +464,31 @@ class VoxelBackBone8x(nn.Module):
             idx = torch.arange(N, device=x_conv.features.device)
             drop_mask = torch.ones(N, device=x_conv.features.device)
             drop_mask[drop_idx] = 0
+
             kept_idx = torch.masked_select(idx, drop_mask.bool())
+            drop_idx = torch.masked_select(idx, ~drop_mask.bool())
+            drop_voxels_coord = torch.index_select(x_conv.indices,0,drop_idx)
+            num_in_boxes =  self.in_box_voxel(x_conv.indices,batch_dict,x_conv.spatial_shape[0]//x_pool_.spatial_shape[0])
+            dropnum_in_boxes = self.in_box_voxel(drop_voxels_coord,batch_dict,x_conv.spatial_shape[0]//x_pool_.spatial_shape[0])
+            # self.voxels_number = voxel_coords.shape[0]
+            # self.drop_voxels_number = drop_idx.numel()
+            # self.voxels_in_boxes_number=num_in_boxes.item() 
+            # self.drop_voxels_in_boxes_number= dropnum_in_boxes.item()
+
+            # save-drop-voxel data
+            self.save_dict['n_voxel_L{}'.format(level)].append(voxel_coords.shape[0])
+            self.save_dict['n_drop_voxel_L{}'.format(level)].append(drop_idx.numel())
+            self.save_dict['n_voxel_inbox_L{}'.format(level)].append(num_in_boxes.item())
+            self.save_dict['n_drop_voxel_inbox_L{}'.format(level)].append(dropnum_in_boxes.item())
+
+            if dropnum_in_boxes.item() / drop_idx.numel() > 0.5:
+                if 'failed_heatmap' not in self.save_dict.keys():
+                    self.save_dict['failed_heatmap'] = []
+                self.save_dict['failed_heatmap'].append(torch.cat([gt_heatmap.unsqueeze(1), conf_map, sparse_mask_],dim=1))  # [gt_heatmap, conf_map]: [bs, 2, 200, 176]
+
+            if self.skip_drop_voxel:
+                if batch_dict['cur_epoch']<self.skip_drop_epoch:
+                    return x_conv, x_conv ,None
 
             indices = torch.index_select(x_conv.indices,0,kept_idx)
             features = torch.index_select(x_conv.features,0,kept_idx)
@@ -299,6 +499,10 @@ class VoxelBackBone8x(nn.Module):
                     batch_size=x_conv.batch_size,
                     )
 
+            # if level == 0:
+                # self.drop_ratio1.append(new_voxel_data.features.shape[0]/x_conv.features.shape[0])
+            # if level == 1:
+                # self.drop_ratio2.append(new_voxel_data.features.shape[0]/x_conv.features.shape[0])
             return new_voxel_data, x_conv,drop_idx
 
     def forward(self, batch_dict):
@@ -330,10 +534,10 @@ class VoxelBackBone8x(nn.Module):
             # print('Sparse Ratio: conf_map:{:.3f}, predictor-out:{:.3f}, sparse-mask:{:.3f}, x_pool1 {:.3f},x-conv1-max:{}'\
                     # .format(conf_map1_sparse_ratio, out_sparse_ratio, sparse_mask_1_sparse_ratio, x_pool1_sparse_ratio, x_conv1.features.abs().max()))
             # x_pool1, sparse_map1 = self.drop_voxel(sparse_mask_1, conf_map1, x_conv1, x_pool1_)
-            x_pool1,x_conv1 ,sparse_map1 = self.drop_voxel(x, batch_dict['frame_id'], 0)
-            x_pool2,x_conv2 ,sparse_map2 = self.drop_voxel(x_pool1, batch_dict['frame_id'], 1)
+            x_pool1,x_conv1 ,sparse_map1 = self.drop_voxel(x, batch_dict['frame_id'], 0,batch_dict)
+            x_pool2,x_conv2 ,sparse_map2 = self.drop_voxel(x_pool1, batch_dict['frame_id'], 1,batch_dict)
             # print(x_conv1.features.shape[0], x_pool1.features.shape[0])
-            self.save_dict['loss'] =  self.predictor_loss
+            self.save_dict['predictor_loss'].append(self.predictor_loss)
 
             x_conv3 = self.conv3(x_pool2)
             x_conv4 = self.conv4(x_conv3)

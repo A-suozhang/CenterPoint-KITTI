@@ -89,13 +89,17 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # bakup the training files
-    if not os.path.exists(os.path.join(output_dir, 'tools')):
-        shutil.copytree('../tools', os.path.join(output_dir,'tools'))
-    if not os.path.exists(os.path.join(output_dir, 'pcdet')):
+    if os.path.exists(os.path.join(output_dir, 'tools')):
+        shutil.rmtree(os.path.join(output_dir, 'tools'))
+    shutil.copytree('../tools', os.path.join(output_dir,'tools'), ignore=shutil.ignore_patterns('scripts','visualization','*.pth'))
+
+    if os.path.exists(os.path.join(output_dir, 'pcdet')):
         # exclude the ops(54M)
-        shutil.copytree('../pcdet/datasets', os.path.join(output_dir,'./pcdet/datasets'))
-        shutil.copytree('../pcdet/models', os.path.join(output_dir,'./pcdet/models'))
-        shutil.copytree('../pcdet/utils', os.path.join(output_dir,'./pcdet/utils'))
+        shutil.rmtree(os.path.join(output_dir, './pcdet'))
+    shutil.copytree('../pcdet/datasets', os.path.join(output_dir,'./pcdet/datasets'))
+    shutil.copytree('../pcdet/models', os.path.join(output_dir,'./pcdet/models'))
+    shutil.copytree('../pcdet/utils', os.path.join(output_dir,'./pcdet/utils'))
+
 
     log_file = output_dir / ('log_train_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     logger = common_utils.create_logger(log_file, rank=cfg.LOCAL_RANK)

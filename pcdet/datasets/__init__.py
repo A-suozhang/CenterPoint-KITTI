@@ -67,4 +67,5 @@ def build_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None,
         drop_last=False, sampler=sampler, timeout=0
     )
     #shuffle=(sampler is None) and training
+    #num_workers=workers
     return dataset, dataloader, sampler
