@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
+from collections import OrderedDict
 
 from pcdet.models.dense_heads.centerpoint_head_single import GaussianFocalLoss
 
@@ -124,41 +125,24 @@ class VoxelBackBone8x(nn.Module):
         self.mask_predictor_output = False
         self.predictor_loss_type = 'gaussian_focal'   # choose the predictor-loss type, could be in cfg
         self.drop_type = 'median'   # choose the predictor-loss type, could be in cfg
-        self.train_predictor_only = True
         self.skip_drop_voxel = True        # no drop-voxel
-        self.only_conv = False
-        self.multi_conv = True
+        self.predictor_type = 'multi_conv'
         if self.use_predictor:
-            self.pools = nn.ModuleList([
-                spconv.SparseMaxPool3d(kernel_size=8),
-                spconv.SparseMaxPool3d(kernel_size=4),
-                spconv.SparseMaxPool3d(kernel_size=2),
-                ]
-            )
-            self.pool1 = spconv.SparseMaxPool3d(kernel_size=8)
-            self.pool2 = spconv.SparseMaxPool3d(kernel_size=4)
-            self.pool3 = spconv.SparseMaxPool3d(kernel_size=2)
-            # self.predictor = nn.Sequential(         # use self.predictor_forward for masked sparse conv2d
-                # nn.Conv2d(4*times*5,1,kernel_size=5,padding='same'),
-                # nn.ReLU(),
-                    # )
-            if self.only_conv:
-                self.predictor_conv = nn.Conv2d(4*times*5,1,kernel_size=5,padding='same')
-                self.predictor_bn = nn.BatchNorm2d(1)
-            elif self.multi_conv:
-                self.predictor_conv1 = nn.Conv2d(4*times*5,64,kernel_size=5,padding='same')
-                self.predictor_conv2 = nn.Conv2d(64,16,kernel_size=5,padding='same')
-                self.predictor_conv3 = nn.Conv2d(16,8,kernel_size=3,padding='same')
-                self.predictor_bn1 = nn.BatchNorm2d(64)
-                self.predictor_bn2 = nn.BatchNorm2d(16)
-                self.predictor_bn3 = nn.BatchNorm2d(8)
-                self.predictor_conv = nn.ModuleList([
-                    self.predictor_conv1,
-                    self.predictor_conv2,
-                    self.predictor_conv3,
-                ])
-
-            self.predictor_nonlinear = nn.Sigmoid()
+            if self.predictor_type == 'multi_conv':
+                num_layers = 3
+                C_ins = [4*times*5,64,16]
+                C_outs = [64,16,8]
+                ks = [5,5,3]
+                pool_strides = [8,4,2]
+                predictor_ordered_dict = OrderedDict()
+                self.pools = nn.ModuleList([spconv.SparseMaxPool3d(kernel_size=pool_stride) for pool_stride in pool_strides])
+                for _ in range(num_layers):
+                    predictor_ordered_dict['conv{}'.format(_+1)] = nn.Conv2d(C_ins[_],C_outs[_],ks[_],padding='same',bias=False)
+                    predictor_ordered_dict['bn{}'.format(_+1)] = nn.BatchNorm2d(C_outs[_],affine=False)
+                    predictor_ordered_dict['nonlinear{}'.format(_+1)] = nn.Sigmoid()
+                self.predictor = nn.Sequential(predictor_ordered_dict)
+            else:
+                raise NotImplementedError
             # Input [x_conv3(max-channel-output)*Z-axis-size]
             # kernel-size should roughly be like the gaussian kernel(TODO: need deiciding)
             self.gt_heatmap = None
@@ -296,21 +280,14 @@ class VoxelBackBone8x(nn.Module):
         pool_size = 4//(level+1)
         x_pool = torch.repeat_interleave(x_pool,pool_size,dim=1)
         sparse_mask_ = (x_pool.sum(dim=1).unsqueeze(1) != 0).int()
-        if self.only_conv:
-            out1 = self.predictor_conv(x_pool)
-            out1_bn = self.predictor_bn(out1)
-            out = self.predictor_nonlinear(out1)
-        if self.multi_conv:
-            out1 = self.predictor_conv1(x_pool)
-            out1_bn = self.predictor_bn1(out1)
-            out1 = self.predictor_nonlinear(out1_bn)
-            out2 = self.predictor_conv2(out1)
-            out2_bn = self.predictor_bn2(out2)
-            out2 = self.predictor_nonlinear(out2_bn)
-            out3 = self.predictor_conv3(out2)
-            out3_bn = self.predictor_bn3(out3)
-            out3 = self.predictor_nonlinear(out3_bn)
-            out = torch.mean(out3,dim=1).unsqueeze(1)    #[bs,1,W,H]
+
+
+        # predictor forward
+        if self.predictor_type=='multi_conv':
+            out_ = self.predictor(x_pool)
+            out = torch.mean(out_,dim=1).unsqueeze(1)    #[bs,1,W,H]
+        else:
+            raise NotImplementedError
 
         if self.mask_predictor_output:
             conf_map = out*sparse_mask_  # DEBUG: whether to mask grad of places that donot have voxels
@@ -527,7 +504,10 @@ class VoxelBackBone8x(nn.Module):
 
         x = self.conv_input(input_sp_tensor) #may cause nan
 
+        # debug-only
         # print('Cur input feature',x.features[0,:])  # [N,C]: reproducibility test, failed
+        # print('\n',batch_dict['frame_id'],batch_dict['voxel_coords'][:3,:])
+        # import ipdb; ipdb.set_trace()
 
         if self.use_predictor:
             self.predictor_loss = 0. # re-init the predictor loss after each iter

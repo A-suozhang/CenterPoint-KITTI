@@ -146,25 +146,32 @@ class CenterHead(nn.Module):
             self.get_targets_single, gt_bboxes_3d, gt_labels_3d,radius)
         # transpose heatmaps, because the dimension of tensors in each task is
         # different, we have to use numpy instead of torch to do the transpose.
-        heatmaps = np.array(heatmaps).transpose(1, 0).tolist()
-        heatmaps = [torch.stack(hms_) for hms_ in heatmaps]
-        # transpose anno_boxes
-        anno_boxes = np.array(anno_boxes).transpose(1, 0).tolist()
-        anno_boxes = [torch.stack(anno_boxes_) for anno_boxes_ in anno_boxes]
-        # transpose inds
-        inds = np.array(inds).transpose(1, 0).tolist()
-        inds = [torch.stack(inds_) for inds_ in inds]
-        # transpose inds
-        masks = np.array(masks).transpose(1, 0).tolist()
-        masks = [torch.stack(masks_) for masks_ in masks]
-        
+
+        # DIRTY FIX: for bs==1, the np.array(heatmaps) will raise error
+        if len(heatmaps)==1 and len(heatmaps[0])==1:
+            heatmaps = [heatmaps[0][0].unsqueeze(0)]
+            anno_boxes = [anno_boxes[0][0].unsqueeze(0)]
+            inds = [inds[0][0].unsqueeze(0)]
+            masks = [masks[0][0].unsqueeze(0)]
+        else:
+            heatmaps = np.array(heatmaps).transpose(1, 0).tolist()
+            heatmaps = [torch.stack(hms_) for hms_ in heatmaps]
+            # transpose anno_boxes
+            anno_boxes = np.array(anno_boxes).transpose(1, 0).tolist()
+            anno_boxes = [torch.stack(anno_boxes_) for anno_boxes_ in anno_boxes]
+            # transpose inds
+            inds = np.array(inds).transpose(1, 0).tolist()
+            inds = [torch.stack(inds_) for inds_ in inds]
+            # transpose inds
+            masks = np.array(masks).transpose(1, 0).tolist()
+            masks = [torch.stack(masks_) for masks_ in masks]
+
         all_targets_dict = {
             'heatmaps': heatmaps,
             'anno_boxes': anno_boxes,
             'inds': inds,
             'masks': masks
         }
-        
         return all_targets_dict
 
     def get_targets_single(self, gt_bboxes_3d, gt_labels_3d,radius):

@@ -8,6 +8,7 @@ class CenterPoint(Detector3DTemplate):
         super().__init__(model_cfg=model_cfg, num_class=num_class, dataset=dataset,times = times)
         self.module_list = self.build_networks()
         self.i = 0
+        self.debug = model_cfg['DEBUG'] if 'debug' in model_cfg.keys() else None
         self.radius = model_cfg['BACKBONE_3D']['RADIUS'] if 'RADIUS' in model_cfg['BACKBONE_3D'].keys() else None
         self.use_predictor = model_cfg['BACKBONE_3D']['use_predictor'] if 'use_predictor' in model_cfg['BACKBONE_3D'].keys() else False
         self.custom_gt_heatmap = model_cfg['BACKBONE_3D']['custom_gt_heatmap'] if 'custom_gt_heatmap' in model_cfg['BACKBONE_3D'].keys() else False
@@ -53,7 +54,10 @@ class CenterPoint(Detector3DTemplate):
             # torch.save(save_dict, f"./visualization/voxels/voxels_GT.pth")
             # exit() 
             self.module_list[1].gt_heatmap = heatmaps # feed into the 3d backbone
-
+        if self.debug:
+            heatmaps = self.module_list[4].assign_targets(batch_dict['gt_boxes'],radiu=None)['heatmaps']
+            self.module_list[3].heatmaps = heatmaps
+            self.module_list[3].debug = self.debug
         # ======== 
         # 0 - VFE
         # 1 - 3D Backbone
@@ -71,13 +75,18 @@ class CenterPoint(Detector3DTemplate):
 
             if hasattr(self.module_list[1],'predictor_loss'):
                 predictor_loss = self.module_list[1].predictor_loss
-            else:
-                predictor_loss = 0.
-
-            ret_dict = {
+                ret_dict = {
                 'loss': loss,
                 'predictor_loss': predictor_loss,
-            }
+                }
+            else:
+                ret_dict = {
+                'loss': loss,
+                }
+            # ret_dict = {
+            #     'loss': loss,
+            #     'predictor_loss': predictor_loss,
+            # }
             return ret_dict, tb_dict, disp_dict
         else:
             pred_dicts, recall_dicts = self.post_processing(batch_dict)

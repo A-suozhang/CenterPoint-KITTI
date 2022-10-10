@@ -75,7 +75,7 @@ class Detector3DTemplate(nn.Module):
             voxel_size=model_info_dict['voxel_size'],
             point_cloud_range=model_info_dict['point_cloud_range'],
             OUT_SIZE_FACTOR = self.model_cfg.DENSE_HEAD.TARGET_ASSIGNER_CONFIG.OUT_SIZE_FACTOR,
-            SKIP_DROP_EPOCH = self.model_cfg.BACKBONE_3D.SKIP_DROP_EPOCH
+            SKIP_DROP_EPOCH = self.model_cfg.BACKBONE_3D.SKIP_DROP_EPOCH if 'SKIP_DROP_EPOCH' in self.model_cfg.BACKBONE_3D else None,
         )
         model_info_dict['module_list'].append(backbone_3d_module)
         model_info_dict['num_point_features'] = backbone_3d_module.num_point_features

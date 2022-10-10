@@ -19,6 +19,7 @@ from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
 import os
 import warnings
+import copy
 # os.environ['CUBLAS_WORKSPACE_CONFIG']=":4096:8"
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -35,18 +36,18 @@ def parse_config():
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
     parser.add_argument('--sync_bn', action='store_true', default=False, help='whether to use sync bn')
     parser.add_argument('--fix_random_seed', action='store_true', default=False, help='')
-    parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
+    parser.add_argument('--ckpt_save_interval', type=int, default=5, help='number of training epochs')
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
     parser.add_argument('--max_ckpt_save_num', type=int, default=30, help='max number of saved checkpoint')
     parser.add_argument('--merge_all_iters_to_one_epoch', action='store_true', default=False, help='')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                         help='set extra config keys if needed')
-
     parser.add_argument('--max_waiting_mins', type=int, default=0, help='max waiting minutes')
     parser.add_argument('--start_epoch', type=int, default=0, help='')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--times', type=int, default=16, help='3D backbone channel. For VoxelBackBone8x, default is 16')
     parser.add_argument('--gpu', type=int, default=0, help='the gpu-id')
+    parser.add_argument('--train_mode', type=int, default=0, help='0: model weight only; 1: predictor weight only; 2: joint training')
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -61,6 +62,8 @@ def parse_config():
 
 def main():
     args, cfg = parse_config()
+    cfg.OPTIMIZATION['train_mode']=args.train_mode  # feed the train_mode into the optim_cfg
+    train_mode = args.train_mode
     if args.launcher == 'none':
         dist_train = False
         total_gpus = 1
@@ -96,8 +99,10 @@ def main():
     if os.path.exists(os.path.join(output_dir, 'pcdet')):
         # exclude the ops(54M)
         shutil.rmtree(os.path.join(output_dir, './pcdet'))
+
     shutil.copytree('../pcdet/datasets', os.path.join(output_dir,'./pcdet/datasets'))
     shutil.copytree('../pcdet/models', os.path.join(output_dir,'./pcdet/models'))
+    shutil.copy('../pcdet/models/backbones_3d/spconv_backbone.py', os.path.join(output_dir,'./'))
     shutil.copytree('../pcdet/utils', os.path.join(output_dir,'./pcdet/utils'))
 
 
@@ -131,27 +136,50 @@ def main():
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
         total_epochs=args.epochs
     )
+    test_set, test_loader, sampler = build_dataloader(
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        batch_size=1, # DEBUG_ONLY
+        dist=dist_train, workers=args.workers, logger=logger, training=False
+    )
+
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set, times = args.times)
     if args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
-    optimizer = build_optimizer(model, cfg.OPTIMIZATION)
-    if model.module_list[1].train_predictor_only:
-        # print(model.module_list[1].predictor_conv)
-        optimizer = build_optimizer(model.module_list[1].predictor_conv
-        , cfg.OPTIMIZATION)
+    # optimizer-predictor should have different OPTIMIZATION PARMAS during train_mode==2
+    # during train_mode=1, cfg.OPTIMIZER to train predictor
+    if train_mode == 0:
+        optimizer = build_optimizer(model, cfg.OPTIMIZATION)
+        optimizer_predictor = None
+    elif train_mode == 1:
+        assert model.module_list[1].use_predictor
+        print(model.module_list[1].predictor)
+        optimizer_predictor = build_optimizer(model.module_list[1].predictor, cfg.OPTIMIZATION)   # name for a new optimizer to avoid load ckpt into the predictor-optimizer
+        optimizer = None
+    elif train_mode == 2:
+        optimizer = build_optimizer(model, cfg.OPTIMIZATION)
+        optimizer_predictor = build_optimizer(model.module_list[1].predictor, cfg.OPTIMIZATION_PREDICTOR)
+    else:
+        raise NotImplementedError
+
+    if model.debug:
+        optimizer = build_optimizer(copy.deepcopy(model), cfg.OPTIMIZATION)
+        # im not sure what these are for
+        import ipdb; ipdb.set_trace()
+
     # load checkpoint if it is possible
     start_epoch = it = 0
     last_epoch = -1
     if args.pretrained_model is not None:
         model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist, logger=logger)
 
+    # not in-use for now
     if args.ckpt is not None:
         it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist, optimizer=optimizer, logger=logger)
         last_epoch = start_epoch + 1
-    else:
         ckpt_list = glob.glob(str(ckpt_dir / '*checkpoint_epoch_*.pth'))
         if len(ckpt_list) > 0:
             ckpt_list.sort(key=os.path.getmtime)
@@ -159,52 +187,120 @@ def main():
                 ckpt_list[-1], to_cpu=dist, optimizer=optimizer, logger=logger
             )
             last_epoch = start_epoch + 1
-    # start_epoch =0
-    # last_epoch = 1
+
     model.train()  # before wrap to DistributedDataParallel to support fixed some parameters
     if dist_train:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[cfg.LOCAL_RANK % torch.cuda.device_count()])
     logger.info(model)
 
-    lr_scheduler, lr_warmup_scheduler = build_scheduler(
-        optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
-        last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
-    )
+    if train_mode == 0:
+        lr_scheduler, lr_warmup_scheduler = build_scheduler(
+            optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
+            last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
+        )
+        lr_scheduler_predictor, lr_warmup_scheduler_predictor = None, None
+    elif train_mode == 1:
+        lr_scheduler, lr_warmup_scheduler = None, None
+        lr_scheduler_predictor, lr_warmup_scheduler_predictor = build_scheduler(
+            optimizer_predictor, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
+            last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
+        )
+    elif train_mode == 2:
+        lr_scheduler, lr_warmup_scheduler = build_scheduler(
+            optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
+            last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
+        )
+        lr_scheduler_predictor, lr_warmup_scheduler_predictor = build_scheduler(
+            optimizer_predictor, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
+            last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION_PREDICTOR
+        )
 
     # -----------------------start training---------------------------
-    logger.info('**********************Start training %s/%s(%s)**********************'
-                % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
-    train_model(
-        model,
-        optimizer,
-        train_loader,
-        model_func=model_fn_decorator(),
-        lr_scheduler=lr_scheduler,
-        optim_cfg=cfg.OPTIMIZATION,
-        start_epoch=start_epoch,
-        total_epochs=args.epochs,
-        start_iter=it,
-        rank=cfg.LOCAL_RANK,
-        tb_log=tb_log,
-        ckpt_save_dir=ckpt_dir,
-        train_sampler=train_sampler,
-        lr_warmup_scheduler=lr_warmup_scheduler,
-        ckpt_save_interval=args.ckpt_save_interval,
-        max_ckpt_save_num=args.max_ckpt_save_num,
-        merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch
-    )
+    logger.info('**********************Start training with train_mode:%s %s/%s(%s)**********************'
+                % (train_mode, cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
+
+    if train_mode == 0:
+        train_model(
+            model,
+            optimizer,
+            train_loader,
+            model_func=model_fn_decorator(),
+            lr_scheduler=lr_scheduler,
+            optim_cfg=cfg.OPTIMIZATION,
+            start_epoch=start_epoch,
+            total_epochs=args.epochs,
+            start_iter=it,
+            rank=cfg.LOCAL_RANK,
+            tb_log=tb_log,
+            ckpt_save_dir=ckpt_dir,
+            train_sampler=train_sampler,
+            lr_warmup_scheduler=lr_warmup_scheduler,
+            ckpt_save_interval=args.ckpt_save_interval,
+            max_ckpt_save_num=args.max_ckpt_save_num,
+            merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
+            train_mode=train_mode,
+            test_loader=test_loader, # feed in the testloader for valid
+            cfg=cfg,
+            logger=logger,
+        )
+    elif train_mode == 1:
+        train_model(
+            model,
+            optimizer_predictor,
+            train_loader,
+            model_func=model_fn_decorator(),
+            lr_scheduler=lr_scheduler_predictor,
+            optim_cfg=cfg.OPTIMIZATION,
+            start_epoch=start_epoch,
+            total_epochs=args.epochs,
+            start_iter=it,
+            rank=cfg.LOCAL_RANK,
+            tb_log=tb_log,
+            ckpt_save_dir=ckpt_dir,
+            train_sampler=train_sampler,
+            lr_warmup_scheduler=lr_warmup_scheduler_predictor,
+            ckpt_save_interval=args.ckpt_save_interval,
+            max_ckpt_save_num=args.max_ckpt_save_num,
+            merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
+            train_mode=train_mode,
+            test_loader=test_loader,
+            cfg=cfg,
+            logger=logger,
+        )
+    elif train_mode == 2:
+        train_model(
+            model,
+            [optimizer,optimizer_predictor],
+            train_loader,
+            model_func=model_fn_decorator(),
+            lr_scheduler=[lr_scheduler, lr_scheduler_predictor],
+            optim_cfg=cfg.OPTIMIZATION,
+            start_epoch=start_epoch,
+            total_epochs=args.epochs,
+            start_iter=it,
+            rank=cfg.LOCAL_RANK,
+            tb_log=tb_log,
+            ckpt_save_dir=ckpt_dir,
+            train_sampler=train_sampler,
+            lr_warmup_scheduler=[lr_warmup_scheduler, lr_warmup_scheduler_predictor],
+            ckpt_save_interval=args.ckpt_save_interval,
+            max_ckpt_save_num=args.max_ckpt_save_num,
+            merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
+            train_mode=train_mode,
+            test_loader=test_loader,
+            cfg=cfg,
+            logger=logger,
+        )
+        import ipdb; ipdb.set_trace()
+
+    else:
+        raise NotImplementedError
 
     logger.info('**********************End training %s/%s(%s)**********************\n\n\n'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
 
     logger.info('**********************Start evaluation %s/%s(%s)**********************' %
                 (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))
-    test_set, test_loader, sampler = build_dataloader(
-        dataset_cfg=cfg.DATA_CONFIG,
-        class_names=cfg.CLASS_NAMES,
-        batch_size=7 , #args.batch_size,
-        dist=dist_train, workers=args.workers, logger=logger, training=False
-    )
     eval_output_dir = output_dir / 'eval' / 'eval_with_train'
     eval_output_dir.mkdir(parents=True, exist_ok=True)
     args.start_epoch = max(args.epochs - 10, 0)  # Only evaluate the last 10 epochs
