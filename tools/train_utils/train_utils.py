@@ -62,7 +62,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             # if model.module_list[1].skip_drop_voxel:
                 # loss = ret_dict['predictor_loss']
         loss.backward()
-        # clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)   # DEBUG_ONLY
+        clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)   # DEBUG_ONLY
         optimizer.step()
 
         accumulated_iter += 1
@@ -232,6 +232,20 @@ def intermediate_eval(cfg, model, dataloader, epoch_id, logger, train_mode, dist
             progress_bar.set_postfix(disp_dict)
             progress_bar.update()
 
+        if train_mode == 1:
+            if i % 10 == 0: # DEBUG_ONLY
+                predictor_d = model.module_list[1].save_dict
+
+                drop_rate_l0 = sum(predictor_d['n_drop_voxel_L0']) / sum(predictor_d['n_voxel_L0'])
+                inbox_rate_l0 = sum(predictor_d['n_drop_voxel_inbox_L0']) / sum(predictor_d['n_drop_voxel_L0'])
+                drop_rate_l1 = sum(predictor_d['n_drop_voxel_L1']) / sum(predictor_d['n_voxel_L1'])
+                inbox_rate_l1 = sum(predictor_d['n_drop_voxel_inbox_L1']) / sum(predictor_d['n_drop_voxel_L1'])
+
+                logger.info('---- validation predictor -----')
+                logger.info('Level0: drop_rate:{:.3f}, drop_inbox_rate:{}'.format(drop_rate_l0, inbox_rate_l0))
+                logger.info('Level1: drop_rate:{:.3f}, drop_inbox_rate:{}'.format(drop_rate_l1, inbox_rate_l1))
+                logger.info('------------------------------')
+
     if cfg.LOCAL_RANK == 0:
         progress_bar.close()
 
@@ -345,6 +359,7 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                     rank=rank, tbar=tbar, tb_log=tb_log,
                     leave_pbar=(cur_epoch + 1 == total_epochs),
                     total_it_each_epoch=total_it_each_epoch,
+                    # total_it_each_epoch=5, # DEBUG_ONLY
                     dataloader_iter=dataloader_iter,
                     cur_epoch = cur_epoch,
                     logger=logger,
@@ -369,8 +384,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                     accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
                     rank=rank, tbar=tbar, tb_log=tb_log,
                     leave_pbar=(cur_epoch + 1 == total_epochs),
-                    total_it_each_epoch=5,
-                    # total_it_each_epoch=total_it_each_epoch,   # DEBUG_ONLY: set total_it_each_epoch smaller for quick debu
+                    # total_it_each_epoch=5,
+                    total_it_each_epoch=total_it_each_epoch,   # DEBUG_ONLY: set total_it_each_epoch smaller for quick debu
                     dataloader_iter=dataloader_iter, 
                     cur_epoch = cur_epoch,
                     logger=logger,
@@ -408,6 +423,10 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
             logger.info('saved at epoch:{}'.format(trained_epoch))
             # reload / mean*
             torch.save(save_d, os.path.join(ckpt_save_dir,'../','saved.pth'))
+            # clear the buffer after saving
+            for d_ in [model.module_list[3].save_dict, model.module_list[1].save_dict]:
+                for k_ in d_.keys():
+                    d_[k_] = []  # empty list
 
 
 def model_state_to_cpu(model_state):
