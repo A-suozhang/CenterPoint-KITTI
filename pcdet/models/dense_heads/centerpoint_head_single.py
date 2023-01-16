@@ -154,17 +154,23 @@ class CenterHead(nn.Module):
             inds = [inds[0][0].unsqueeze(0)]
             masks = [masks[0][0].unsqueeze(0)]
         else:
-            heatmaps = np.array(heatmaps).transpose(1, 0).tolist()
-            heatmaps = [torch.stack(hms_) for hms_ in heatmaps]
+            # heatmaps are nested list of [bs]-[1] 
+            # need [bs,tensor_size] of list[1]
+            heatmaps = torch.stack([torch.stack(hm_) for hm_ in heatmaps]).transpose(0,1)  # [1,bs,tensor_size]
+            heatmaps = [hm_ for hm_ in heatmaps]
+            # deprecated version: after torch 1.9, the below method will raise 'move cuda tensor to cpu then np.array'
+            # heatmaps = np.array(heatmaps).transpose(1, 0).tolist()
+            # heatmaps = [torch.stack(hms_) for hms_ in heatmaps]
+
             # transpose anno_boxes
-            anno_boxes = np.array(anno_boxes).transpose(1, 0).tolist()
-            anno_boxes = [torch.stack(anno_boxes_) for anno_boxes_ in anno_boxes]
+            anno_boxes = torch.stack([torch.stack(anno_) for anno_ in anno_boxes]).transpose(0,1)  # [1,bs,tensor_size]
+            anno_boxes = [anno_ for anno_ in anno_boxes]
             # transpose inds
-            inds = np.array(inds).transpose(1, 0).tolist()
-            inds = [torch.stack(inds_) for inds_ in inds]
+            inds = torch.stack([torch.stack(inds_) for inds_ in inds]).transpose(0,1)  # [1,bs,tensor_size]
+            inds = [inds_ for inds_ in inds]
             # transpose inds
-            masks = np.array(masks).transpose(1, 0).tolist()
-            masks = [torch.stack(masks_) for masks_ in masks]
+            masks = torch.stack([torch.stack(masks_) for masks_ in masks]).transpose(0,1)  # [1,bs,tensor_size]
+            masks = [masks_ for masks_ in masks]
 
         all_targets_dict = {
             'heatmaps': heatmaps,
