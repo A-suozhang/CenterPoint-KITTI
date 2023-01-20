@@ -513,7 +513,7 @@ class VoxelBackBone8x(nn.Module):
             self.predictor_loss = 0. # re-init the predictor loss after each iter
             # print('Sparse Ratio: conf_map:{:.3f}, predictor-out:{:.3f}, sparse-mask:{:.3f}, x_pool1 {:.3f},x-conv1-max:{}'\
                     # .format(conf_map1_sparse_ratio, out_sparse_ratio, sparse_mask_1_sparse_ratio, x_pool1_sparse_ratio, x_conv1.features.abs().max()))
-            # x_pool1, sparse_map1 = self.drop_voxel(sparse_mask_1, conf_map1, x_conv1, x_pool1_)
+            # x_pool1, sparse_map1 = self.drop_voxel(sparse_mask_1, conf_map1, x_conv1, x_pool1_)=
             x_pool1,x_conv1 ,sparse_map1 = self.drop_voxel(x, batch_dict['frame_id'], 0,batch_dict)
             x_pool2,x_conv2 ,sparse_map2 = self.drop_voxel(x_pool1, batch_dict['frame_id'], 1,batch_dict)
             # print(x_conv1.features.shape[0], x_pool1.features.shape[0])

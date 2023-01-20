@@ -21,13 +21,13 @@ import os
 import warnings
 import copy
 # os.environ['CUBLAS_WORKSPACE_CONFIG']=":4096:8"
+
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
 
     parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
     parser.add_argument('--epochs', type=int, default=None, required=False, help='number of epochs to train for')
-    # parser.add_argument('--workers', type=int, default=8, help='number of workers for dataloader')
     parser.add_argument('--workers', type=int, default=0, help='number of workers for dataloader')
     parser.add_argument('--extra_tag', type=str, default='default', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
@@ -48,6 +48,7 @@ def parse_config():
     parser.add_argument('--times', type=int, default=16, help='3D backbone channel. For VoxelBackBone8x, default is 16')
     parser.add_argument('--gpu', type=int, default=0, help='the gpu-id')
     parser.add_argument('--train_mode', type=int, default=0, help='0: model weight only; 1: predictor weight only; 2: joint training')
+    parser.add_argument('--debug', action='store_true', default=False, help='debug mode, each epoch only 10 iters')
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -62,7 +63,7 @@ def parse_config():
 
 def main():
     args, cfg = parse_config()
-    cfg.OPTIMIZATION['train_mode']=args.train_mode  # feed the train_mode into the optim_cfg
+    cfg.debug = args.debug
     train_mode = args.train_mode
     if args.launcher == 'none':
         dist_train = False
@@ -108,7 +109,6 @@ def main():
 
     log_file = output_dir / ('log_train_%s.txt' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
     logger = common_utils.create_logger(log_file, rank=cfg.LOCAL_RANK)
-
     # log to file
     logger.info('**********************Start logging**********************')
     gpu_list = os.environ['CUDA_VISIBLE_DEVICES'] if 'CUDA_VISIBLE_DEVICES' in os.environ.keys() else 'ALL'
@@ -122,8 +122,6 @@ def main():
     if cfg.LOCAL_RANK == 0:
         # save the config filename as "config.yaml" for better loading
         os.system('cp %s %s' % (args.cfg_file, os.path.join(output_dir, "config.yaml")))
-
-    tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
 
     # -----------------------create dataloader & network & optimizer---------------------------
     train_set, train_loader, train_sampler = build_dataloader(
@@ -226,12 +224,11 @@ def main():
             train_loader,
             model_func=model_fn_decorator(),
             lr_scheduler=lr_scheduler,
-            optim_cfg=cfg.OPTIMIZATION,
+            cfg=cfg,
             start_epoch=start_epoch,
             total_epochs=args.epochs,
             start_iter=it,
             rank=cfg.LOCAL_RANK,
-            tb_log=tb_log,
             ckpt_save_dir=ckpt_dir,
             train_sampler=train_sampler,
             lr_warmup_scheduler=lr_warmup_scheduler,
@@ -240,7 +237,6 @@ def main():
             merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
             train_mode=train_mode,
             test_loader=test_loader, # feed in the testloader for valid
-            cfg=cfg,
             logger=logger,
         )
     elif train_mode == 1:
@@ -250,12 +246,11 @@ def main():
             train_loader,
             model_func=model_fn_decorator(),
             lr_scheduler=lr_scheduler_predictor,
-            optim_cfg=cfg.OPTIMIZATION,
+            cfg=cfg,
             start_epoch=start_epoch,
             total_epochs=args.epochs,
             start_iter=it,
             rank=cfg.LOCAL_RANK,
-            tb_log=tb_log,
             ckpt_save_dir=ckpt_dir,
             train_sampler=train_sampler,
             lr_warmup_scheduler=lr_warmup_scheduler_predictor,
@@ -264,7 +259,6 @@ def main():
             merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
             train_mode=train_mode,
             test_loader=test_loader,
-            cfg=cfg,
             logger=logger,
         )
     elif train_mode == 2:
@@ -274,12 +268,11 @@ def main():
             train_loader,
             model_func=model_fn_decorator(),
             lr_scheduler=[lr_scheduler, lr_scheduler_predictor],
-            optim_cfg=cfg.OPTIMIZATION,
+            cfg=cfg,
             start_epoch=start_epoch,
             total_epochs=args.epochs,
             start_iter=it,
             rank=cfg.LOCAL_RANK,
-            tb_log=tb_log,
             ckpt_save_dir=ckpt_dir,
             train_sampler=train_sampler,
             lr_warmup_scheduler=[lr_warmup_scheduler, lr_warmup_scheduler_predictor],
@@ -288,7 +281,6 @@ def main():
             merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
             train_mode=train_mode,
             test_loader=test_loader,
-            cfg=cfg,
             logger=logger,
         )
         import ipdb; ipdb.set_trace()

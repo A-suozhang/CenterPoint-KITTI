@@ -1,3 +1,4 @@
+import tqdm
 import logging
 import os
 import pickle
@@ -80,12 +81,23 @@ def get_voxel_centers(voxel_coords, downsample_times, voxel_size, point_cloud_ra
     voxel_centers = (voxel_centers + 0.5) * voxel_size + pc_range
     return voxel_centers
 
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 def create_logger(log_file=None, rank=0, log_level=logging.INFO):
     logger = logging.getLogger(__name__)
     logger.setLevel(log_level if rank == 0 else 'ERROR')
     formatter = logging.Formatter('%(asctime)s  %(levelname)5s  %(message)s')
-    console = logging.StreamHandler()
+    console = TqdmLoggingHandler()
     console.setLevel(log_level if rank == 0 else 'ERROR')
     console.setFormatter(formatter)
     logger.addHandler(console)
